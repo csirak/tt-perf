@@ -1,0 +1,27 @@
+# Build artifacts
+build/
+*.o
+*.a
+
+# Profiling
+*.tracy
+.logs/
+**/profile_log_*.csv
+**/tracy_*.csv
+**/ops_perf_*.csv
+
+# Reports (keep locally, not in git)
+bench/reports/
+tt-ml/*.tracy
+tt-ml/*.csv
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Misc
+.DS_Store
+*.swp
+.vscode/
+._.DS_Store

@@ -1,0 +1,16 @@
+training_config:
+  project_name: "bench_nanogpt"
+  seed: 5489
+  model_save_interval: 99999
+  batch_size: 32
+  num_epochs: 1
+  max_steps: 15
+  learning_rate: 0.0003
+  weight_decay: 0.01
+  tokenizer_type: char
+  model_config: "tt-train/configs/model_configs/nanogpt.yaml"
+  data_path: "tt-train/data/shakespeare.txt"
+
+device_config:
+  enable_ddp: false
+  mesh_shape: [1,1]

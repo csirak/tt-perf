@@ -57,7 +57,7 @@ inline void relu(const Tensor& x, Tensor& out, Tensor& mask) {
 }
 
 inline void gelu(const Tensor& x, Tensor& out) {
-    out = ttnn::gelu(x);
+    out = ttnn::gelu(x, true);  // fast_and_approximate=true
 }
 
 inline void mean(const Tensor& x, Tensor& out) {
@@ -74,15 +74,17 @@ inline void sum_dim(const Tensor& x, int dim, Tensor& out) {
 
 // Softmax with max-centering for numerical stability
 // softmax(x) = softmax(x - max(x))
+// x_max is reduced (small), use L1
 inline void softmax(const Tensor& x, int dim, Tensor& out) {
-    auto x_max = ttnn::max(x, dim, true);
+    auto x_max = ttnn::max(x, dim, true, ttnn::L1_MEMORY_CONFIG);
     auto x_centered = ttnn::subtract(x, x_max);
     out = ttnn::softmax(x_centered, dim);
 }
 
 // Transpose last two dimensions (for attention: K -> K.T)
+// Force DRAM output to avoid L1 OOM
 inline void transpose_last2(const Tensor& x, Tensor& out) {
-    out = ttnn::transpose(x, -2, -1);
+    out = ttnn::transpose(x, -2, -1, ttnn::DRAM_MEMORY_CONFIG, std::nullopt);
 }
 
 // ============================================================================
@@ -99,9 +101,10 @@ inline void gelu_backward(const Tensor& d_out, const Tensor& x, Tensor& d_in) {
 }
 
 // Softmax backward: d_in = softmax * (d_out - sum(d_out * softmax, dim, keepdim=True))
+// sum_dy_y is reduced (small), use L1
 inline void softmax_backward(const Tensor& d_out, const Tensor& softmax_out, int dim, Tensor& d_in) {
     auto dy_y = ttnn::multiply(d_out, softmax_out);
-    auto sum_dy_y = ttnn::sum(dy_y, dim, true);
+    auto sum_dy_y = ttnn::sum(dy_y, dim, true, ttnn::L1_MEMORY_CONFIG);
     d_in = ttnn::multiply(softmax_out, ttnn::subtract(d_out, sum_dy_y));
 }
 
@@ -130,7 +133,8 @@ inline void mse_backward(const Tensor& diff, float scale, Tensor& d_pred) {
 // ============================================================================
 
 inline void sgd_update(Tensor& param, const Tensor& grad, float lr) {
-    param = ttnn::subtract(param, ttnn::multiply(grad, lr));
+    auto scaled = ttnn::multiply(grad, lr);
+    param = ttnn::subtract(param, scaled);
 }
 
 }  // namespace traced

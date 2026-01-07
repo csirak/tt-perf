@@ -17,9 +17,12 @@
 #include <algorithm>
 #include <numeric>
 #include <cmath>
+#include <cstdlib>
 
 using namespace ttnn;
 using namespace tt::tt_metal::distributed;
+using DispatchCoreConfig = tt::tt_metal::DispatchCoreConfig;
+using DispatchCoreType = tt::tt_metal::DispatchCoreType;
 
 constexpr int N_WARMUP = 10;
 constexpr int N_ITER = 50;
@@ -80,7 +83,15 @@ BenchResult benchmark_matmul(MeshDevice& device, uint32_t size) {
 }
 
 int main() {
-    auto device = open_mesh_device(0, DEFAULT_L1_SMALL_SIZE, DEFAULT_TRACE_REGION_SIZE);
+    // Set USE_ETH_DISPATCH=1 to use ETH dispatch (8x8 grid) instead of WORKER (8x7 grid)
+    bool use_eth = std::getenv("USE_ETH_DISPATCH") != nullptr;
+    auto device = use_eth
+        ? MeshDevice::create_unit_mesh(0, DEFAULT_L1_SMALL_SIZE, DEFAULT_TRACE_REGION_SIZE, 1,
+            DispatchCoreConfig{DispatchCoreType::ETH})
+        : open_mesh_device(0, DEFAULT_L1_SMALL_SIZE, DEFAULT_TRACE_REGION_SIZE);
+
+    auto grid = device->compute_with_storage_grid_size();
+    fmt::print("# Compute grid: {}x{} = {} cores\n", grid.x, grid.y, grid.x * grid.y);
 
     std::vector<uint32_t> sizes = {128, 256, 512, 1024, 2048, 4096};
     std::vector<BenchResult> results;
@@ -95,6 +106,10 @@ int main() {
                    result.size, result.mean_us, result.std_us,
                    result.min_us, result.max_us);
     }
+
+    // Cleanup
+    Finish(device->mesh_command_queue());
+    ttnn::close_device(*device);
 
     return 0;
 }

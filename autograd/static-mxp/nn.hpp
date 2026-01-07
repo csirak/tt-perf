@@ -8,6 +8,7 @@
 #pragma once
 
 #include "ops.hpp"
+#include "tensor_group.hpp"
 #include <ttnn/operations/eltwise/unary/unary_composite.hpp>
 #include <ttnn/operations/eltwise/ternary/ternary_composite.hpp>
 #include <ttnn/operations/core/compute_kernel/compute_kernel_config.hpp>
@@ -15,12 +16,18 @@
 #include <ttnn/operations/copy/typecast/typecast.hpp>
 #include <cmath>
 #include <vector>
+#include <cstdlib>
 
 #ifdef TRACY_ENABLE
 #include <tracy/Tracy.hpp>
 #endif
 
 namespace static_autograd {
+
+// Import TypecastCache from static_mxp namespace
+using static_mxp::TypecastCache;
+using static_mxp::WeightTypecastCache;
+using static_mxp::TensorGroup;
 
 // Linear layer: y = x @ weight.T + bias
 // Owns: weight, bias, d_weight, d_bias, output buffer
@@ -818,6 +825,168 @@ struct Linear3DBFP8 {
 };
 
 // =============================================================================
+// LinearBFP8MXP: BFP8 Linear with pre-allocated BF16 caches for batched typecast
+//
+// Key difference from Linear3DBFP8:
+// - Has out_bf16 and x_bf16_cache buffers
+// - backward_fn uses these caches (NO inline typecast!)
+// - TypecastCache fills these caches BEFORE backward pass
+// =============================================================================
+struct LinearBFP8MXP {
+    // BFP8 weights (forward compute)
+    Tensor weight;          // BFP8 [out_dim, in_dim]
+    Tensor bias;            // BFP8 [1, 1, out_dim]
+
+    // BF16 master weights (SGD)
+    Tensor weight_bf16;
+    Tensor bias_bf16;
+
+    // Gradients (BF16)
+    Tensor d_weight;
+    Tensor d_bias;
+
+    // Output buffers
+    Tensor out;             // BFP8 forward output
+    Tensor d_out;           // BF16 gradient
+
+    // *** MXP: BF16 caches for backward (filled by TypecastCache before backward) ***
+    Tensor out_bf16;        // BF16 cache of forward output
+    Tensor x_bf16_cache;    // BF16 cache of input activation
+
+    // Store input Value* for cache registration
+    Value* cached_x = nullptr;
+
+    uint32_t in_dim;
+    uint32_t out_dim;
+
+    static ttnn::WormholeComputeKernelConfig get_compute_config() {
+        return ttnn::WormholeComputeKernelConfig{
+            .math_fidelity = MathFidelity::HiFi2,
+            .math_approx_mode = false,
+            .fp32_dest_acc_en = false,
+            .packer_l1_acc = true,
+        };
+    }
+
+    LinearBFP8MXP(uint32_t batch, uint32_t seq, uint32_t in_d, uint32_t out_d, float init, MeshDevice& dev)
+        : weight(make_full_bfp8(ttnn::Shape({out_d, in_d}), init, dev)),
+          bias(make_zeros_bfp8(ttnn::Shape({1, 1, out_d}), dev)),
+          weight_bf16(make_full(ttnn::Shape({out_d, in_d}), init, dev)),
+          bias_bf16(make_zeros(ttnn::Shape({1, 1, out_d}), dev)),
+          d_weight(make_zeros(ttnn::Shape({out_d, in_d}), dev)),
+          d_bias(make_zeros(ttnn::Shape({1, 1, out_d}), dev)),
+          out(make_zeros_bfp8(ttnn::Shape({batch, seq, out_d}), dev)),
+          d_out(make_zeros(ttnn::Shape({batch, seq, out_d}), dev)),
+          // MXP caches
+          out_bf16(make_zeros(ttnn::Shape({batch, seq, out_d}), dev)),
+          x_bf16_cache(make_zeros(ttnn::Shape({batch, seq, in_d}), dev)),
+          in_dim(in_d),
+          out_dim(out_d) {}
+
+    Value* forward(Graph& g, Value* x) {
+#ifdef TRACY_ENABLE
+        ZoneScopedN("LinearBFP8MXP_forward");
+#endif
+        auto* w = g.leaf(&weight, &d_weight, true);
+        auto* b = g.leaf(&bias, &d_bias, true);
+
+        // Store input for cache registration
+        cached_x = x;
+
+        // Fused BFP8 linear: x @ weight.T + bias
+        out = ttnn::linear(*x->data, weight, bias,
+                           /*transpose_a=*/false, /*transpose_b=*/true,
+                           /*memory_config=*/std::nullopt,
+                           /*dtype=*/std::nullopt,
+                           /*program_config=*/std::nullopt,
+                           /*activation=*/std::nullopt,
+                           /*compute_kernel_config=*/get_compute_config());
+
+        auto* v = g.node(&out, &d_out);
+        v->parents = {x, w, b};
+
+        // Backward uses PRE-CASTED BF16 tensors (no typecast here!)
+        v->backward_fn = [x, w, b, this, v]() {
+#ifdef TRACY_ENABLE
+            ZoneScopedN("LinearBFP8MXP_backward");
+#endif
+            if (!v->grad) return;
+
+            // Use pre-casted out_bf16 (gradient already BF16 from d_out)
+            const auto& dout_bf16 = *v->grad;  // d_out is already BF16
+
+            // d_input = dout @ weight
+            if (x->requires_grad) {
+#ifdef TRACY_ENABLE
+                ZoneScopedN("d_input_matmul");
+#endif
+                x->accumulate_grad(ttnn::matmul(dout_bf16, weight_bf16));
+            }
+
+            // d_weight = dout.T @ x (use pre-casted x_bf16_cache!)
+            if (w->requires_grad) {
+#ifdef TRACY_ENABLE
+                ZoneScopedN("d_weight_compute");
+#endif
+                // *** MXP: Use cached BF16 input instead of inline typecast ***
+                w->accumulate_grad(ttnn::matmul(dout_bf16, x_bf16_cache, true, false));
+            }
+
+            // d_bias = sum(dout, dims=[0,1])
+            if (b->requires_grad) {
+#ifdef TRACY_ENABLE
+                ZoneScopedN("d_bias_sum");
+#endif
+                auto sum0 = ttnn::sum(dout_bf16, 0, true);
+                b->accumulate_grad(ttnn::sum(sum0, 1, true));
+            }
+        };
+
+        return v;
+    }
+
+    void sgd_step(float lr) {
+#ifdef TRACY_ENABLE
+        ZoneScopedN("LinearBFP8MXP_sgd_step");
+#endif
+        weight_bf16 = ttnn::subtract(weight_bf16, ttnn::multiply(d_weight, lr));
+        bias_bf16 = ttnn::subtract(bias_bf16, ttnn::multiply(d_bias, lr));
+
+        // Cast back to BFP8 for next forward
+        ttnn::typecast(weight_bf16, ttnn::DataType::BFLOAT8_B, std::nullopt, weight);
+        ttnn::typecast(bias_bf16, ttnn::DataType::BFLOAT8_B, std::nullopt, bias);
+    }
+
+    // SGD step that only updates BF16 master weights (no typecast)
+    // Use with WeightTypecastCache for batched BF16→BFP8 conversion
+    void sgd_step_bf16_only(float lr) {
+#ifdef TRACY_ENABLE
+        ZoneScopedN("LinearBFP8MXP_sgd_step_bf16_only");
+#endif
+        weight_bf16 = ttnn::subtract(weight_bf16, ttnn::multiply(d_weight, lr));
+        bias_bf16 = ttnn::subtract(bias_bf16, ttnn::multiply(d_bias, lr));
+        // NO typecast here - done in batch by WeightTypecastCache
+    }
+
+    // Register this layer's tensors for batch typecast
+    // Call after forward(), before backward()
+    void register_caches(TypecastCache& cache) {
+        // Register input activation: x (BFP8) -> x_bf16_cache
+        if (cached_x && cached_x->data) {
+            cache.register_pair(cached_x->data, &x_bf16_cache);
+        }
+        // Note: out is BFP8, but d_out is already BF16 (gradient buffer)
+        // If we needed to convert out for backward, we'd register it too
+    }
+
+    // Register weight pairs for batched BF16→BFP8 conversion after SGD
+    void register_weight_caches(WeightTypecastCache& cache) {
+        cache.register_pair(&weight_bf16, &weight);
+        cache.register_pair(&bias_bf16, &bias);
+    }
+};
+
+// =============================================================================
 // FFNBFP8: Feed-Forward Network with BFP8 matmuls
 // Linear (BFP8) -> GELU -> Linear (BFP8)
 // =============================================================================
@@ -848,6 +1017,62 @@ struct FFNBFP8 {
     void sgd_step(float lr) {
         w1.sgd_step(lr);
         w2.sgd_step(lr);
+    }
+};
+
+// =============================================================================
+// FFNBFP8MXP: Feed-Forward Network with batched typecast
+// Uses LinearBFP8MXP - backward uses pre-casted BF16 buffers
+// =============================================================================
+struct FFNBFP8MXP {
+    LinearBFP8MXP w1;    // [dim, ffn_dim]
+    LinearBFP8MXP w2;    // [ffn_dim, dim]
+
+    // GELU intermediate buffers
+    Tensor gelu_out;     // BFP8 (for forward)
+    Tensor gelu_out_bf16; // BF16 cache (for backward)
+    Tensor d_gelu_out;   // BF16 (gradient)
+
+    FFNBFP8MXP(uint32_t batch, uint32_t seq, uint32_t dim, uint32_t ffn_dim, float init, MeshDevice& dev)
+        : w1(batch, seq, dim, ffn_dim, init, dev),
+          w2(batch, seq, ffn_dim, dim, init, dev),
+          gelu_out(make_zeros_bfp8(ttnn::Shape({batch, seq, ffn_dim}), dev)),
+          gelu_out_bf16(make_zeros(ttnn::Shape({batch, seq, ffn_dim}), dev)),
+          d_gelu_out(make_zeros(ttnn::Shape({batch, seq, ffn_dim}), dev)) {}
+
+    Value* forward(Graph& g, Value* x) {
+#ifdef TRACY_ENABLE
+        ZoneScopedN("FFNBFP8MXP_forward");
+#endif
+        auto* h = w1.forward(g, x);
+        // GELU operates on BFP8
+        h = gelu(g, h, &gelu_out, &d_gelu_out);
+        return w2.forward(g, h);
+    }
+
+    void sgd_step(float lr) {
+        w1.sgd_step(lr);
+        w2.sgd_step(lr);
+    }
+
+    // SGD step that only updates BF16 master weights (no typecast)
+    void sgd_step_bf16_only(float lr) {
+        w1.sgd_step_bf16_only(lr);
+        w2.sgd_step_bf16_only(lr);
+    }
+
+    // Register all BFP8 activations for batch typecast before backward
+    void register_caches(TypecastCache& cache) {
+        w1.register_caches(cache);
+        w2.register_caches(cache);
+        // GELU output is BFP8 and used by w2 backward
+        cache.register_pair(&gelu_out, &gelu_out_bf16);
+    }
+
+    // Register weight pairs for batched BF16→BFP8 conversion after SGD
+    void register_weight_caches(WeightTypecastCache& cache) {
+        w1.register_weight_caches(cache);
+        w2.register_weight_caches(cache);
     }
 };
 
@@ -1157,6 +1382,233 @@ struct PersistentTransformerLayerBFP8 {
 };
 
 // =============================================================================
+// TransformerLayerMXP: Transformer with batched typecast for BFP8 FFN
+// - Attention: BF16 (unchanged)
+// - FFN: BFP8 with batched typecast via TypecastCache
+// =============================================================================
+struct TransformerLayerMXP {
+    // Modules (attention stays BF16, FFN uses BFP8 with batched typecast)
+    LayerNorm ln1;            // BF16 output (attention is BF16)
+    LayerNormBFP8 ln2;        // BFP8 output (feeds directly into BFP8 FFN)
+    Linear3D wq, wk, wv, wo;  // Attention projections stay BF16
+    FFNBFP8MXP ffn;           // BFP8 FFN with MXP caching
+
+    // Attention config
+    float scale;
+    uint32_t batch, seq, dim, heads, head_dim;
+
+    // Forward buffers
+    Tensor q_proj, k_proj, v_proj;
+    Tensor d_q_proj, d_k_proj, d_v_proj;
+    Tensor attn_scores, d_attn_scores;
+    Tensor attn_weights, d_attn_weights;
+    Tensor attn_out, d_attn_out;
+    Tensor attn_proj, d_attn_proj;
+    Tensor residual1, d_residual1;
+    Tensor ffn_out, d_ffn_out;
+    Tensor output, d_output;
+    Tensor causal_mask;
+
+    TransformerLayerMXP(uint32_t b, uint32_t s, uint32_t d, uint32_t h,
+                        uint32_t ffn_mult, float init, MeshDevice& dev)
+        : ln1(b, s, d, 1e-5f, dev),
+          ln2(b, s, d, 1e-5f, dev),
+          wq(b, s, d, d, init, dev),
+          wk(b, s, d, d, init, dev),
+          wv(b, s, d, d, init, dev),
+          wo(b, s, d, d, init, dev),
+          ffn(b, s, d, d * ffn_mult, init, dev),  // BFP8 FFN with MXP
+          scale(1.0f / std::sqrt(static_cast<float>(d / h))),
+          batch(b), seq(s), dim(d), heads(h), head_dim(d / h),
+          q_proj(make_zeros(ttnn::Shape({b, s, d}), dev)),
+          k_proj(make_zeros(ttnn::Shape({b, s, d}), dev)),
+          v_proj(make_zeros(ttnn::Shape({b, s, d}), dev)),
+          d_q_proj(make_zeros(ttnn::Shape({b, s, d}), dev)),
+          d_k_proj(make_zeros(ttnn::Shape({b, s, d}), dev)),
+          d_v_proj(make_zeros(ttnn::Shape({b, s, d}), dev)),
+          attn_scores(make_zeros(ttnn::Shape({b, s, s}), dev)),
+          d_attn_scores(make_zeros(ttnn::Shape({b, s, s}), dev)),
+          attn_weights(make_zeros(ttnn::Shape({b, s, s}), dev)),
+          d_attn_weights(make_zeros(ttnn::Shape({b, s, s}), dev)),
+          attn_out(make_zeros(ttnn::Shape({b, s, d}), dev)),
+          d_attn_out(make_zeros(ttnn::Shape({b, s, d}), dev)),
+          attn_proj(make_zeros(ttnn::Shape({b, s, d}), dev)),
+          d_attn_proj(make_zeros(ttnn::Shape({b, s, d}), dev)),
+          residual1(make_zeros(ttnn::Shape({b, s, d}), dev)),
+          d_residual1(make_zeros(ttnn::Shape({b, s, d}), dev)),
+          ffn_out(make_zeros(ttnn::Shape({b, s, d}), dev)),
+          d_ffn_out(make_zeros(ttnn::Shape({b, s, d}), dev)),
+          output(make_zeros(ttnn::Shape({b, s, d}), dev)),
+          d_output(make_zeros(ttnn::Shape({b, s, d}), dev)),
+          causal_mask(PersistentTransformerLayer::create_causal_mask(s, dev)) {}
+
+    Value* forward(Graph& g, Value* x) {
+#ifdef TRACY_ENABLE
+        ZoneScopedN("TransformerLayerMXP_forward");
+#endif
+        // LN1
+        auto* ln1_v = ln1.forward(g, x);
+
+        // QKV projections (BF16)
+        auto* q_v = wq.forward(g, ln1_v);
+        auto* k_v = wk.forward(g, ln1_v);
+        auto* v_v = wv.forward(g, ln1_v);
+
+        // Simplified attention: scores = Q @ K.T * scale
+        attn_scores = ttnn::multiply(ttnn::matmul(*q_v->data, *k_v->data, false, true), scale);
+
+        // Apply causal mask
+        auto scores_masked = ttnn::add(attn_scores, causal_mask);
+
+        // Softmax
+        auto x_max = ttnn::max(scores_masked, -1, true);
+        auto x_centered = ttnn::subtract(scores_masked, x_max);
+        attn_weights = ttnn::softmax(x_centered, -1);
+
+        // attn_out = attn_weights @ V
+        attn_out = ttnn::matmul(attn_weights, *v_v->data);
+
+        // Create node for attention output
+        auto* attn_v = g.node(&attn_out, &d_attn_out);
+        attn_v->parents = {q_v, k_v, v_v};
+
+        // Attention backward (unchanged - all BF16)
+        attn_v->backward_fn = [q_v, k_v, v_v, this, attn_v]() {
+            if (!attn_v->grad) return;
+            const auto& dout = *attn_v->grad;
+
+            auto d_attn = ttnn::matmul(dout, *v_v->data, false, true);
+            if (v_v->requires_grad) {
+                v_v->accumulate_grad(ttnn::matmul(attn_weights, dout, true, false));
+            }
+
+            auto dy_y = ttnn::multiply(d_attn, attn_weights);
+            auto sum_dy_y = ttnn::sum(dy_y, -1, true);
+            auto d_scores = ttnn::multiply(attn_weights, ttnn::subtract(d_attn, sum_dy_y));
+            auto d_scores_scaled = ttnn::multiply(d_scores, scale);
+
+            if (q_v->requires_grad) {
+                q_v->accumulate_grad(ttnn::matmul(d_scores_scaled, *k_v->data));
+            }
+            if (k_v->requires_grad) {
+                k_v->accumulate_grad(ttnn::matmul(d_scores_scaled, *q_v->data, true, false));
+            }
+        };
+
+        // Output projection
+        auto* attn_proj_v = wo.forward(g, attn_v);
+
+        // Residual 1
+        auto* res1_v = add(g, x, attn_proj_v, &residual1, &d_residual1);
+
+        // LN2 (outputs BFP8 for FFN)
+        auto* ln2_v = ln2.forward(g, res1_v);
+
+        // BFP8 FFN (backward will use pre-casted BF16 from TypecastCache)
+        auto* ffn_v = ffn.forward(g, ln2_v);
+
+        // Residual 2
+        return add(g, res1_v, ffn_v, &output, &d_output);
+    }
+
+    // Execute forward without graph construction (reuses buffers)
+    Tensor* execute_forward(const Tensor& x) {
+        // LN1 (BF16)
+        auto mean_val = ttnn::mean(x, -1, true);
+        auto x_centered = ttnn::subtract(x, mean_val);
+        auto var = ttnn::mean(ttnn::multiply(x_centered, x_centered), -1, true);
+        ln1.rstd = ttnn::rsqrt(ttnn::add(var, ln1.eps), true);
+        ln1.x_norm = ttnn::multiply(x_centered, ln1.rstd);
+        ln1.out = ttnn::add(ttnn::multiply(ln1.gamma, ln1.x_norm), ln1.beta);
+
+        // QKV projections (BF16)
+        wq.out = ttnn::add(ttnn::matmul(ln1.out, wq.weight, false, true), wq.bias);
+        wk.out = ttnn::add(ttnn::matmul(ln1.out, wk.weight, false, true), wk.bias);
+        wv.out = ttnn::add(ttnn::matmul(ln1.out, wv.weight, false, true), wv.bias);
+
+        // Attention scores + mask + softmax
+        attn_scores = ttnn::multiply(ttnn::matmul(wq.out, wk.out, false, true), scale);
+        auto scores_masked = ttnn::add(attn_scores, causal_mask);
+        auto scores_max = ttnn::max(scores_masked, -1, true);
+        auto scores_centered = ttnn::subtract(scores_masked, scores_max);
+        attn_weights = ttnn::softmax(scores_centered, -1);
+
+        // Attention output
+        attn_out = ttnn::matmul(attn_weights, wv.out);
+
+        // Output projection
+        wo.out = ttnn::add(ttnn::matmul(attn_out, wo.weight, false, true), wo.bias);
+
+        // Residual 1
+        residual1 = ttnn::add(x, wo.out);
+
+        // LN2 (BFP8 output)
+        auto mean2 = ttnn::mean(residual1, -1, true);
+        auto centered2 = ttnn::subtract(residual1, mean2);
+        auto var2 = ttnn::mean(ttnn::multiply(centered2, centered2), -1, true);
+        ln2.rstd = ttnn::rsqrt(ttnn::add(var2, ln2.eps), true);
+        ln2.x_norm = ttnn::multiply(centered2, ln2.rstd);
+        auto scaled2 = ttnn::multiply(ln2.gamma, ln2.x_norm);
+        ttnn::add(scaled2, ln2.beta, ttnn::DataType::BFLOAT8_B, std::nullopt, ln2.out);
+
+        // BFP8 FFN
+        ffn.w1.out = ttnn::linear(ln2.out, ffn.w1.weight, ffn.w1.bias,
+                                  /*transpose_a=*/false, /*transpose_b=*/true,
+                                  /*memory_config=*/std::nullopt,
+                                  /*dtype=*/std::nullopt,
+                                  /*program_config=*/std::nullopt,
+                                  /*activation=*/std::nullopt,
+                                  /*compute_kernel_config=*/LinearBFP8MXP::get_compute_config());
+        ffn.gelu_out = ttnn::gelu(ffn.w1.out, true);
+        ffn.w2.out = ttnn::linear(ffn.gelu_out, ffn.w2.weight, ffn.w2.bias,
+                                  /*transpose_a=*/false, /*transpose_b=*/true,
+                                  /*memory_config=*/std::nullopt,
+                                  /*dtype=*/std::nullopt,
+                                  /*program_config=*/std::nullopt,
+                                  /*activation=*/std::nullopt,
+                                  /*compute_kernel_config=*/LinearBFP8MXP::get_compute_config());
+
+        // Residual 2
+        output = ttnn::add(residual1, ffn.w2.out);
+        return &output;
+    }
+
+    void sgd_step(float lr) {
+        ln1.sgd_step(lr);
+        ln2.sgd_step(lr);
+        wq.sgd_step(lr);
+        wk.sgd_step(lr);
+        wv.sgd_step(lr);
+        wo.sgd_step(lr);
+        ffn.sgd_step(lr);
+    }
+
+    // SGD step with BF16-only for FFN (attention stays inline)
+    // Only FFN has BFP8 weights that need batched typecast
+    void sgd_step_bf16_only(float lr) {
+        // BF16 layers update normally (no separate typecast phase)
+        ln1.sgd_step(lr);
+        ln2.sgd_step(lr);
+        wq.sgd_step(lr);
+        wk.sgd_step(lr);
+        wv.sgd_step(lr);
+        wo.sgd_step(lr);
+        // FFN: only update BF16 masters, skip typecast
+        ffn.sgd_step_bf16_only(lr);
+    }
+
+    // Register FFN caches for batched typecast
+    void register_caches(TypecastCache& cache) {
+        ffn.register_caches(cache);
+    }
+
+    // Register FFN weight pairs for batched BF16→BFP8 conversion after SGD
+    void register_weight_caches(WeightTypecastCache& cache) {
+        ffn.register_weight_caches(cache);
+    }
+};
+
+// =============================================================================
 // PersistentGPT2BFP8: GPT-2 with BFP8 FFN layers for high throughput
 // =============================================================================
 template<size_t N>
@@ -1210,14 +1662,36 @@ struct PersistentGPT2BFP8 {
         built = true;
     }
 
-    void train_step() {
-        if (!built) build();
-        graph.zero_grad();
-        graph.backward(loss_node);
-        for (size_t i = 0; i < N; ++i) {
-            layers[i].sgd_step(lr);
+    void train_step(MeshDevice* dev) {
+        {
+#ifdef TRACY_ENABLE
+            ZoneScopedN("forward");
+#endif
+            if (!built) build();
+            tt::tt_metal::distributed::Synchronize(dev, std::nullopt);
         }
-        output_proj.sgd_step(lr);
+
+        {
+#ifdef TRACY_ENABLE
+            ZoneScopedN("backward");
+#endif
+            graph.zero_grad();
+            graph.backward(loss_node);
+            tt::tt_metal::distributed::Synchronize(dev, std::nullopt);
+        }
+
+        {
+#ifdef TRACY_ENABLE
+            ZoneScopedN("sgd_step");
+#endif
+            for (size_t i = 0; i < N; ++i) {
+                layers[i].sgd_step(lr);
+            }
+            output_proj.sgd_step(lr);
+            tt::tt_metal::distributed::Synchronize(dev, std::nullopt);
+        }
+
+        built = false;  // Force rebuild next iteration (re-run forward)
     }
 };
 
@@ -1299,25 +1773,369 @@ struct PersistentGPT2 {
     }
 
     // Full training step
-    void train_step() {
-        if (!built) build();
-
-        // Forward - executed implicitly during graph construction
-        // For persistent execution, we'd need execute_forward()
-
-        // Backward
-        graph.zero_grad();
-        graph.backward(loss_node);
-
-        // SGD
-        for (size_t i = 0; i < N; ++i) {
-            layers[i].sgd_step(lr);
+    void train_step(MeshDevice* dev) {
+        {
+#ifdef TRACY_ENABLE
+            ZoneScopedN("forward");
+#endif
+            if (!built) build();
+            tt::tt_metal::distributed::Synchronize(dev, std::nullopt);
         }
-        output_proj.sgd_step(lr);
+
+        {
+#ifdef TRACY_ENABLE
+            ZoneScopedN("backward");
+#endif
+            graph.zero_grad();
+            graph.backward(loss_node);
+            tt::tt_metal::distributed::Synchronize(dev, std::nullopt);
+        }
+
+        {
+#ifdef TRACY_ENABLE
+            ZoneScopedN("sgd_step");
+#endif
+            for (size_t i = 0; i < N; ++i) {
+                layers[i].sgd_step(lr);
+            }
+            output_proj.sgd_step(lr);
+            tt::tt_metal::distributed::Synchronize(dev, std::nullopt);
+        }
+
+        built = false;  // Force rebuild next iteration (re-run forward)
     }
 
     float get_loss(MeshDevice* dev) {
         tt::tt_metal::distributed::Synchronize(dev, std::nullopt);
+        return static_cast<float>(loss.cpu().to_vector<bfloat16>()[0]);
+    }
+};
+
+// =============================================================================
+// PersistentGPT2MXP: GPT-2 with batched typecast for BFP8 FFN
+// Key difference: TypecastCache batches all BFP8→BF16 conversions before backward
+// =============================================================================
+template<size_t N>
+struct PersistentGPT2MXP {
+    static_assert(N >= 1, "Must have at least 1 layer");
+
+    std::vector<TransformerLayerMXP> layers;
+    Linear3D output_proj;
+
+    // TypecastCache for batched BFP8→BF16 conversion
+    TypecastCache ffn_cache;
+
+    Tensor input, d_input;
+    Tensor target;
+    Tensor loss, d_loss, diff;
+
+    Graph graph;
+    Value* input_node = nullptr;
+    Value* loss_node = nullptr;
+    bool built = false;
+    bool cache_graph = std::getenv("MXP_DISABLE_GRAPH_CACHE") == nullptr;
+    uint32_t weight_typecast_every = 1;
+    uint64_t step = 0;
+
+    uint32_t batch, seq, dim, vocab;
+    float lr;
+    MeshDevice* device;
+
+    PersistentGPT2MXP(uint32_t b, uint32_t s, uint32_t d, uint32_t h, uint32_t ffn_mult,
+                      uint32_t v, float learning_rate, MeshDevice& dev)
+        : output_proj(b, s, d, v, 0.02f, dev),
+          input(make_zeros(ttnn::Shape({b, s, d}), dev)),
+          d_input(make_zeros(ttnn::Shape({b, s, d}), dev)),
+          target(make_zeros(ttnn::Shape({b, s, v}), dev)),
+          loss(make_zeros(ttnn::Shape({1, 1}), dev)),
+          d_loss(make_zeros(ttnn::Shape({1, 1}), dev)),
+          diff(make_zeros(ttnn::Shape({b, s, v}), dev)),
+          batch(b), seq(s), dim(d), vocab(v),
+          lr(learning_rate),
+          device(&dev)
+    {
+        layers.reserve(N);
+        for (size_t i = 0; i < N; ++i) {
+            layers.emplace_back(b, s, d, h, ffn_mult, 0.02f, dev);
+        }
+    }
+
+    void build_graph() {
+#ifdef TRACY_ENABLE
+        ZoneScopedN("PersistentGPT2MXP_build");
+#endif
+        input_node = graph.leaf(&input, &d_input, false);
+
+        Value* h = input_node;
+        for (size_t i = 0; i < N; ++i) {
+            h = layers[i].forward(graph, h);
+        }
+
+        auto* logits = output_proj.forward(graph, h);
+        loss_node = mse(graph, logits, &target, &loss, &d_loss, &diff);
+        graph.build_topo(loss_node);
+
+        // Register all FFN caches for batched typecast
+        ffn_cache.clear();
+        for (size_t i = 0; i < N; ++i) {
+            layers[i].register_caches(ffn_cache);
+        }
+
+        built = true;
+    }
+
+    // Execute forward without graph construction (reuses buffers)
+    void execute_forward() {
+        Tensor* h = &input;
+        for (size_t i = 0; i < N; ++i) {
+            h = layers[i].execute_forward(*h);
+        }
+
+        // Output projection
+        output_proj.out = ttnn::add(ttnn::matmul(*h, output_proj.weight, false, true), output_proj.bias);
+
+        // MSE loss
+        diff = ttnn::subtract(output_proj.out, target);
+        auto sq = ttnn::multiply(diff, diff);
+        loss = ttnn::mean(sq, std::nullopt, true);
+    }
+
+    void train_step() {
+#ifdef TRACY_ENABLE
+        ZoneScopedN("PersistentGPT2MXP_train_step");
+#endif
+        {
+#ifdef TRACY_ENABLE
+            ZoneScopedN("forward");
+#endif
+            if (!built || !cache_graph) {
+                build_graph();
+            }
+            if (cache_graph) {
+                execute_forward();
+            }
+            tt::tt_metal::distributed::Synchronize(device, std::nullopt);
+        }
+
+        // *** MXP: Batch typecast all FFN activations BEFORE backward ***
+        {
+#ifdef TRACY_ENABLE
+            ZoneScopedN("batch_typecast_ffn");
+#endif
+            ffn_cache.convert_all();
+            tt::tt_metal::distributed::Synchronize(device, std::nullopt);
+        }
+
+        // Backward pass (uses pre-casted BF16 tensors)
+        {
+#ifdef TRACY_ENABLE
+            ZoneScopedN("backward");
+#endif
+            graph.zero_grad();
+            graph.backward(loss_node);
+            tt::tt_metal::distributed::Synchronize(device, std::nullopt);
+        }
+
+        // SGD step
+        {
+#ifdef TRACY_ENABLE
+            ZoneScopedN("sgd_step");
+#endif
+            for (size_t i = 0; i < N; ++i) {
+                layers[i].sgd_step(lr);
+            }
+            output_proj.sgd_step(lr);
+            tt::tt_metal::distributed::Synchronize(device, std::nullopt);
+        }
+
+        if (!cache_graph) {
+            built = false;  // Rebuild graph each iteration when cache is disabled
+        }
+    }
+
+    float get_loss() {
+        tt::tt_metal::distributed::Synchronize(device, std::nullopt);
+        return static_cast<float>(loss.cpu().to_vector<bfloat16>()[0]);
+    }
+};
+
+// =============================================================================
+// PersistentGPT2MXP2: GPT-2 with FULLY batched typecast
+// Key difference from MXP: Also batches weight BF16→BFP8 conversion after SGD
+//
+// Phase flow:
+// 1. forward (BFP8 compute)
+// 2. batch_typecast_ffn (activation BFP8→BF16 for backward)
+// 3. backward (BF16 gradients)
+// 4. sgd_step_bf16_only (update BF16 masters, NO typecast)
+// 5. batch_typecast_weights (BF16→BFP8 for next forward) <- NEW
+// =============================================================================
+template<size_t N>
+struct PersistentGPT2MXP2 {
+    static_assert(N >= 1, "Must have at least 1 layer");
+
+    std::vector<TransformerLayerMXP> layers;
+    Linear3D output_proj;
+
+    // TypecastCache for batched BFP8→BF16 conversion (activations before backward)
+    TypecastCache ffn_cache;
+
+    // WeightTypecastCache for batched BF16→BFP8 conversion (weights after SGD)
+    WeightTypecastCache weight_cache;
+
+    Tensor input, d_input;
+    Tensor target;
+    Tensor loss, d_loss, diff;
+
+    Graph graph;
+    Value* input_node = nullptr;
+    Value* loss_node = nullptr;
+    bool built = false;
+    bool cache_graph = std::getenv("MXP_DISABLE_GRAPH_CACHE") == nullptr;
+
+    uint32_t batch, seq, dim, vocab;
+    float lr;
+    MeshDevice* device;
+
+    PersistentGPT2MXP2(uint32_t b, uint32_t s, uint32_t d, uint32_t h, uint32_t ffn_mult,
+                       uint32_t v, float learning_rate, MeshDevice& dev)
+        : output_proj(b, s, d, v, 0.02f, dev),
+          input(make_zeros(ttnn::Shape({b, s, d}), dev)),
+          d_input(make_zeros(ttnn::Shape({b, s, d}), dev)),
+          target(make_zeros(ttnn::Shape({b, s, v}), dev)),
+          loss(make_zeros(ttnn::Shape({1, 1}), dev)),
+          d_loss(make_zeros(ttnn::Shape({1, 1}), dev)),
+          diff(make_zeros(ttnn::Shape({b, s, v}), dev)),
+          batch(b), seq(s), dim(d), vocab(v),
+          lr(learning_rate),
+          device(&dev)
+    {
+        layers.reserve(N);
+        for (size_t i = 0; i < N; ++i) {
+            layers.emplace_back(b, s, d, h, ffn_mult, 0.02f, dev);
+        }
+
+        if (const char* env = std::getenv("MXP_WEIGHT_TYPECAST_EVERY")) {
+            int val = std::atoi(env);
+            weight_typecast_every = val > 0 ? static_cast<uint32_t>(val) : 1;
+        }
+    }
+
+    void build_graph() {
+#ifdef TRACY_ENABLE
+        ZoneScopedN("PersistentGPT2MXP2_build");
+#endif
+        input_node = graph.leaf(&input, &d_input, false);
+
+        Value* h = input_node;
+        for (size_t i = 0; i < N; ++i) {
+            h = layers[i].forward(graph, h);
+        }
+
+        auto* logits = output_proj.forward(graph, h);
+        loss_node = mse(graph, logits, &target, &loss, &d_loss, &diff);
+        graph.build_topo(loss_node);
+
+        // Register all FFN caches for batched typecast (activations)
+        ffn_cache.clear();
+        for (size_t i = 0; i < N; ++i) {
+            layers[i].register_caches(ffn_cache);
+        }
+
+        // Register all FFN weight caches for batched typecast (weights)
+        weight_cache.clear();
+        for (size_t i = 0; i < N; ++i) {
+            layers[i].register_weight_caches(weight_cache);
+        }
+
+        built = true;
+    }
+
+    // Execute forward without graph construction (reuses buffers)
+    void execute_forward() {
+        Tensor* h = &input;
+        for (size_t i = 0; i < N; ++i) {
+            h = layers[i].execute_forward(*h);
+        }
+
+        // Output projection
+        output_proj.out = ttnn::add(ttnn::matmul(*h, output_proj.weight, false, true), output_proj.bias);
+
+        // MSE loss
+        diff = ttnn::subtract(output_proj.out, target);
+        auto sq = ttnn::multiply(diff, diff);
+        loss = ttnn::mean(sq, std::nullopt, true);
+    }
+
+    void train_step() {
+#ifdef TRACY_ENABLE
+        ZoneScopedN("PersistentGPT2MXP2_train_step");
+#endif
+        // 1. Forward pass (BFP8 compute)
+        {
+#ifdef TRACY_ENABLE
+            ZoneScopedN("forward");
+#endif
+            if (!built || !cache_graph) {
+                build_graph();
+            }
+            if (cache_graph) {
+                execute_forward();
+            }
+            tt::tt_metal::distributed::Synchronize(device, std::nullopt);
+        }
+
+        // 2. Batch typecast all FFN activations BFP8→BF16 BEFORE backward
+        {
+#ifdef TRACY_ENABLE
+            ZoneScopedN("batch_typecast_ffn");
+#endif
+            ffn_cache.convert_all();
+            tt::tt_metal::distributed::Synchronize(device, std::nullopt);
+        }
+
+        // 3. Backward pass (uses pre-casted BF16 tensors)
+        {
+#ifdef TRACY_ENABLE
+            ZoneScopedN("backward");
+#endif
+            graph.zero_grad();
+            graph.backward(loss_node);
+            tt::tt_metal::distributed::Synchronize(device, std::nullopt);
+        }
+
+        // 4. SGD step (BF16 only - no inline typecast)
+        {
+#ifdef TRACY_ENABLE
+            ZoneScopedN("sgd_step_bf16_only");
+#endif
+            for (size_t i = 0; i < N; ++i) {
+                layers[i].sgd_step_bf16_only(lr);
+            }
+            output_proj.sgd_step(lr);  // output_proj is BF16, normal sgd
+            tt::tt_metal::distributed::Synchronize(device, std::nullopt);
+        }
+
+        // 5. Batch typecast all FFN weights BF16→BFP8 for next forward
+        {
+#ifdef TRACY_ENABLE
+            ZoneScopedN("batch_typecast_weights");
+#endif
+            if (weight_typecast_every == 1 || (step % weight_typecast_every) == 0) {
+                weight_cache.convert_all();
+                tt::tt_metal::distributed::Synchronize(device, std::nullopt);
+            }
+        }
+
+        if (!cache_graph) {
+            built = false;  // Rebuild graph each iteration when cache is disabled
+        }
+
+        step += 1;
+    }
+
+    float get_loss() {
+        tt::tt_metal::distributed::Synchronize(device, std::nullopt);
         return static_cast<float>(loss.cpu().to_vector<bfloat16>()[0]);
     }
 };

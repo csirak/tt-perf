@@ -25,3 +25,6 @@ __pycache__/
 *.swp
 .vscode/
 ._.DS_Store
+
+# Verification outputs (binary tensor files)
+verify/outputs/

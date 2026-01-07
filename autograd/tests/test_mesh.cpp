@@ -14,12 +14,18 @@
 
 using namespace traced;
 using namespace tt::tt_metal::distributed;
+using DispatchCoreConfig = tt::tt_metal::DispatchCoreConfig;
+using DispatchCoreType = tt::tt_metal::DispatchCoreType;
 
 constexpr int N_WARMUP = 3;
 constexpr int N_TIMED = 5;
 
 int main() {
-    auto device = MeshDevice::create_unit_mesh(0);
+    // Default to ETH dispatch for 8x8 grid on N300
+    auto device = MeshDevice::create_unit_mesh(
+        0, DEFAULT_L1_SMALL_SIZE, DEFAULT_TRACE_REGION_SIZE, 1,
+        DispatchCoreConfig{DispatchCoreType::ETH}
+    );
     MeshCommandQueue& cq = device->mesh_command_queue();
 
     auto grid_size = device->compute_with_storage_grid_size();

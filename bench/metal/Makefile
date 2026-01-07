@@ -1,6 +1,9 @@
 # TT-Metal paths
-TT_METAL := ~/tt-metal
+TT_METAL := $(HOME)/tt-metal
 BUILD_DIR := $(TT_METAL)/build_Release
+
+# Environment for running binaries
+RUN_ENV := TT_METAL_HOME=$(TT_METAL) TT_METAL_RUNTIME_ROOT=$(TT_METAL) ARCH_NAME=wormhole_b0
 
 # simple_add (low-level Metal API)
 METAL_EXAMPLES := $(TT_METAL)/tt_metal/programming_examples
@@ -28,7 +31,7 @@ add-build:
 	cd $(BUILD_DIR) && ninja simple_add
 
 add-run:
-	cd $(TT_METAL) && ./build_Release/programming_examples/simple_add
+	$(RUN_ENV) $(TT_METAL)/build_Release/programming_examples/simple_add
 
 # === simple_matmul (TTNN C++ API) ===
 matmul: matmul-sync matmul-build matmul-run
@@ -41,7 +44,7 @@ matmul-build:
 	cd $(BUILD_DIR) && ninja example_matmul
 
 matmul-run:
-	cd $(TT_METAL) && ./build_Release/ttnn/examples/example_matmul
+	$(RUN_ENV) $(TT_METAL)/build_Release/ttnn/examples/example_matmul
 
 # === matmul_sweep (TTNN C++ sweep benchmark) ===
 sweep: sweep-sync sweep-build sweep-run
@@ -54,7 +57,7 @@ sweep-build:
 	cd $(BUILD_DIR) && ninja example_matmul
 
 sweep-run:
-	cd $(TT_METAL) && ./build_Release/ttnn/examples/example_matmul
+	$(RUN_ENV) $(TT_METAL)/build_Release/ttnn/examples/example_matmul
 
 # === matmul_2dev (2-device MeshDevice benchmark) ===
 # Uses TT_VISIBLE_DEVICES to limit to 2 devices (one N300 card: chips 0 and 4)
@@ -68,7 +71,7 @@ sweep-run:
 	cd $(BUILD_DIR) && ninja example_matmul
 
 2dev-run:
-	cd $(TT_METAL) && TT_VISIBLE_DEVICES=0,4 ./build_Release/ttnn/examples/example_matmul
+	$(RUN_ENV) TT_VISIBLE_DEVICES=0,4 $(TT_METAL)/build_Release/ttnn/examples/example_matmul
 
 # === distributed matmul (2-device data parallel - legacy) ===
 dist: dist-sync dist-build dist-run
@@ -81,7 +84,7 @@ dist-build:
 	cd $(BUILD_DIR) && ninja example_matmul
 
 dist-run:
-	cd $(TT_METAL) && TT_VISIBLE_DEVICES=0,4 ./build_Release/ttnn/examples/example_matmul
+	$(RUN_ENV) TT_VISIBLE_DEVICES=0,4 $(TT_METAL)/build_Release/ttnn/examples/example_matmul
 
 # === tensor parallel matmul (TRUE distributed - column sharding + all_gather) ===
 tp: tp-sync tp-build tp-run
@@ -94,7 +97,7 @@ tp-build:
 	cd $(BUILD_DIR) && ninja example_matmul
 
 tp-run:
-	cd $(TT_METAL) && TT_VISIBLE_DEVICES=0,4 ./build_Release/ttnn/examples/example_matmul
+	$(RUN_ENV) TT_VISIBLE_DEVICES=0,4 $(TT_METAL)/build_Release/ttnn/examples/example_matmul
 
 # === Command Queue Async vs Sync Benchmark ===
 cq: cq-sync cq-build cq-run
@@ -107,7 +110,7 @@ cq-build:
 	cd $(BUILD_DIR) && ninja example_matmul
 
 cq-run:
-	cd $(TT_METAL) && ./build_Release/ttnn/examples/example_matmul
+	$(RUN_ENV) $(TT_METAL)/build_Release/ttnn/examples/example_matmul
 
 # === Memory Config & Fusion Benchmark ===
 fusion: fusion-sync fusion-build fusion-run
@@ -120,7 +123,7 @@ fusion-build:
 	cd $(BUILD_DIR) && ninja example_matmul
 
 fusion-run:
-	cd $(TT_METAL) && ./build_Release/ttnn/examples/example_matmul
+	$(RUN_ENV) $(TT_METAL)/build_Release/ttnn/examples/example_matmul
 
 # === Linear-ReLU-Linear CQ Benchmark ===
 lrl: lrl-sync lrl-build lrl-run
@@ -133,7 +136,20 @@ lrl-build:
 	cd $(BUILD_DIR) && ninja example_matmul
 
 lrl-run:
-	cd $(TT_METAL) && ./build_Release/ttnn/examples/example_matmul
+	$(RUN_ENV) $(TT_METAL)/build_Release/ttnn/examples/example_matmul
+
+# === BFP8 vs BF16 Matmul Benchmark ===
+bfp8: bfp8-sync bfp8-build bfp8-run
+
+bfp8-sync:
+	mkdir -p $(MATMUL_DIR)
+	cp matmul_bfp8.cpp $(MATMUL_DIR)/matmul.cpp
+
+bfp8-build:
+	cd $(BUILD_DIR) && ninja example_matmul
+
+bfp8-run:
+	$(RUN_ENV) $(TT_METAL)/build_Release/ttnn/examples/example_matmul
 
 # Legacy aliases
 sync: add-sync
@@ -143,3 +159,55 @@ run: add-run
 clean:
 	rm -f $(BUILD_DIR)/programming_examples/simple_add
 	rm -f $(BUILD_DIR)/ttnn/examples/example_matmul
+
+# === GEMM Top 10 Benchmark ===
+top10: top10-sync top10-build top10-run
+
+top10-sync:
+	mkdir -p $(MATMUL_DIR)
+	cp bench_gemm_top10.cpp $(MATMUL_DIR)/matmul.cpp
+
+top10-build:
+	cd $(BUILD_DIR) && ninja example_matmul
+
+top10-run:
+	$(RUN_ENV) $(TT_METAL)/build_Release/ttnn/examples/example_matmul
+
+# === GEMM Sharded Benchmark (L1 sharding for smaller matrices) ===
+sharded: sharded-sync sharded-build sharded-run
+
+sharded-sync:
+	mkdir -p $(MATMUL_DIR)
+	cp bench_gemm_sharded.cpp $(MATMUL_DIR)/matmul.cpp
+
+sharded-build:
+	cd $(BUILD_DIR) && ninja example_matmul
+
+sharded-run:
+	$(RUN_ENV) $(TT_METAL)/build_Release/ttnn/examples/example_matmul
+
+# === GEMM BFP8 Top 10 Benchmark ===
+bfp8-top10: bfp8-top10-sync bfp8-top10-build bfp8-top10-run
+
+bfp8-top10-sync:
+	mkdir -p $(MATMUL_DIR)
+	cp bench_gemm_bfp8.cpp $(MATMUL_DIR)/matmul.cpp
+
+bfp8-top10-build:
+	cd $(BUILD_DIR) && ninja example_matmul
+
+bfp8-top10-run:
+	$(RUN_ENV) $(TT_METAL)/build_Release/ttnn/examples/example_matmul
+
+# === GEMM BF16 Top 10 Benchmark (HiFi2) ===
+bf16-top10: bf16-top10-sync bf16-top10-build bf16-top10-run
+
+bf16-top10-sync:
+	mkdir -p $(MATMUL_DIR)
+	cp bench_gemm_bf16_top10.cpp $(MATMUL_DIR)/matmul.cpp
+
+bf16-top10-build:
+	cd $(BUILD_DIR) && ninja example_matmul
+
+bf16-top10-run:
+	$(RUN_ENV) $(TT_METAL)/build_Release/ttnn/examples/example_matmul

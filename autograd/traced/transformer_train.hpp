@@ -17,6 +17,8 @@
 #include "ops.hpp"
 #include <ttnn/operations/data_movement/reshape_view/reshape.hpp>
 #include <ttnn/operations/data_movement/transpose/transpose.hpp>
+#include <ttnn/operations/transformer/sdpa/sdpa.hpp>
+#include <ttnn/operations/transformer/sdpa_config.hpp>
 #include <cmath>
 #include <vector>
 
@@ -50,23 +52,40 @@ struct SharedAttentionBuffers {
         return ttnn::triu(mask, 1);
     }
 
-    // Attention forward using shared buffers
+    // Attention forward using TTNN fused SDPA with optimized compute config
     void attention_forward(const Tensor& q, const Tensor& k, const Tensor& v, Tensor& output) {
-        scores = ttnn::multiply(ttnn::matmul(q, k, false, true), scale);
-        scores_masked = ttnn::add(scores, causal_mask);
-        traced::softmax(scores_masked, -1, attn_weights);
-        output = ttnn::matmul(attn_weights, v);
+        // Use TTNN's fused scaled dot-product attention (FlashAttention-style)
+        // is_causal=true handles the causal mask internally
+        // Output to DRAM to avoid L1 OOM when transpose follows
+        output = ttnn::transformer::scaled_dot_product_attention(
+            q, k, v,
+            std::nullopt,  // no explicit mask - use is_causal
+            true,          // is_causal = true
+            scale,         // 1/sqrt(d_h)
+            std::nullopt,  // no sliding window
+            ttnn::DRAM_MEMORY_CONFIG,  // output to DRAM
+            std::nullopt,  // auto program config
+            traced::get_bf16_compute_config()  // HiFi2 + packer_l1_acc
+        );
     }
 
-    // Attention backward using shared buffers
+    // Attention backward - must recompute attention weights (FlashAttention pattern)
+    // SDPA is forward-only, so we recompute the softmax weights for backward
+    // Uses opt_matmul for all matmuls to get HiFi2 + packer_l1_acc
     void attention_backward(const Tensor& q, const Tensor& k, const Tensor& v,
                            const Tensor& d_out, Tensor& d_q, Tensor& d_k, Tensor& d_v) {
-        d_attn = ttnn::matmul(d_out, v, false, true);
-        d_v = ttnn::matmul(attn_weights, d_out, true, false);
+        // Recompute attention weights (scores + mask + softmax)
+        scores = ttnn::multiply(traced::opt_matmul(q, k, false, true), scale);
+        scores_masked = ttnn::add(scores, causal_mask);
+        traced::softmax(scores_masked, -1, attn_weights);
+
+        // Now compute gradients using recomputed attn_weights
+        d_attn = traced::opt_matmul(d_out, v, false, true);
+        d_v = traced::opt_matmul(attn_weights, d_out, true, false);
         traced::softmax_backward(d_attn, attn_weights, -1, d_scores);
         auto d_scores_scaled = ttnn::multiply(d_scores, scale);
-        d_q = ttnn::matmul(d_scores_scaled, k);
-        d_k = ttnn::matmul(d_scores_scaled, q, true, false);
+        d_q = traced::opt_matmul(d_scores_scaled, k);
+        d_k = traced::opt_matmul(d_scores_scaled, q, true, false);
     }
 };
 
@@ -118,12 +137,12 @@ struct TracedTransformerLayerTrainable {
                                     uint32_t ffn_mult, float learning_rate, MeshDevice& dev)
         : ln1(d, 1e-5f, dev),
           ln2(d, 1e-5f, dev),
-          wq(d, d, 0.01f, dev),
-          wk(d, d, 0.01f, dev),
-          wv(d, d, 0.01f, dev),
-          wo(d, d, 0.01f, dev),
-          w1(d, d * ffn_mult, 0.01f, dev),
-          w2(d * ffn_mult, d, 0.01f, dev),
+          wq(d, d, 0.02f, dev),  // std=0.02 matches PyTorch GPT-2 init
+          wk(d, d, 0.02f, dev),
+          wv(d, d, 0.02f, dev),
+          wo(d, d, 0.02f, dev),
+          w1(d, d * ffn_mult, 0.02f, dev),
+          w2(d * ffn_mult, d, 0.02f, dev),
           // Forward buffers
           ln1_out(make_zeros(ttnn::Shape({b, s, d}), dev)),
           q_proj(make_zeros(ttnn::Shape({b, s, d}), dev)),
@@ -165,14 +184,16 @@ struct TracedTransformerLayerTrainable {
           lr(learning_rate) {}
 
     // Reshape [B, S, D] -> [B, H, S, D/H]
+    // Force DRAM output on transpose to avoid L1 OOM
     Tensor reshape_to_heads(const Tensor& x) {
         auto reshaped = ttnn::reshape(x, ttnn::Shape({batch, seq, heads, head_dim}));
-        return ttnn::transpose(reshaped, 1, 2);  // [B, S, H, D/H] -> [B, H, S, D/H]
+        return ttnn::transpose(reshaped, 1, 2, ttnn::DRAM_MEMORY_CONFIG, std::nullopt);
     }
 
     // Reshape [B, H, S, D/H] -> [B, S, D]
+    // Force DRAM output on transpose to avoid L1 OOM
     Tensor merge_heads(const Tensor& x) {
-        auto transposed = ttnn::transpose(x, 1, 2);  // [B, H, S, D/H] -> [B, S, H, D/H]
+        auto transposed = ttnn::transpose(x, 1, 2, ttnn::DRAM_MEMORY_CONFIG, std::nullopt);
         return ttnn::reshape(transposed, ttnn::Shape({batch, seq, dim}));
     }
 
@@ -296,7 +317,7 @@ struct TracedTransformerStack {
         : attn_buf(b, h, s, d / h, dev),
           diff(make_zeros(ttnn::Shape({b, s, d}), dev)),
           sq(make_zeros(ttnn::Shape({b, s, d}), dev)),
-          loss(make_zeros(ttnn::Shape({1, 1}), dev)),
+          loss(make_zeros(ttnn::Shape({1, 1, 1}), dev)),  // 3D for mean output with keepdim=true
           d_loss(make_zeros(ttnn::Shape({b, s, d}), dev)),
           loss_scale(1.0f / (b * s * d)),
           batch(b), seq(s), dim(d)
@@ -395,6 +416,7 @@ struct TracedTransformerWithEmbedding {
     uint32_t batch, seq, dim, vocab_size;
     float loss_scale;
     float lr;
+    float last_loss_value = 0.0f;  // Cached loss value from last compute_loss
 
     TracedTransformerWithEmbedding(uint32_t b, uint32_t s, uint32_t d, uint32_t h,
                                     uint32_t ffn_mult, uint32_t vocab, float learning_rate,
@@ -410,7 +432,7 @@ struct TracedTransformerWithEmbedding {
           pos_indices(create_position_indices(b, s, dev)),
           diff(make_zeros(ttnn::Shape({b, s, vocab}), dev)),
           sq(make_zeros(ttnn::Shape({b, s, vocab}), dev)),
-          loss(make_zeros(ttnn::Shape({1, 1}), dev)),
+          loss(make_zeros(ttnn::Shape({1, 1, 1}), dev)),  // 3D for mean output with keepdim=true
           d_loss(make_zeros(ttnn::Shape({b, s, vocab}), dev)),
           d_combined_emb(make_zeros(ttnn::Shape({b, s, d}), dev)),
           batch(b), seq(s), dim(d), vocab_size(vocab),
@@ -454,10 +476,17 @@ struct TracedTransformerWithEmbedding {
         output_proj.forward(layers[N - 1].get_output(), logits);
     }
 
-    void compute_loss(const Tensor& target_logits) {
+    void compute_loss(const Tensor& target_logits, MeshDevice* dev = nullptr) {
         traced::subtract(logits, target_logits, diff);
         traced::multiply(diff, diff, sq);
-        traced::mean(sq, loss);
+        loss = ttnn::mean(sq, std::nullopt, false);  // keepdim=false for scalar
+
+        // Cache the loss value if device provided
+        if (dev) {
+            tt::tt_metal::distributed::Synchronize(dev, std::nullopt);
+            auto vec = loss.cpu().to_vector<bfloat16>();
+            last_loss_value = vec.empty() ? -1.0f : static_cast<float>(vec[0]);
+        }
     }
 
     void backward(const Tensor& token_ids) {
@@ -493,16 +522,16 @@ struct TracedTransformerWithEmbedding {
         output_proj.sgd_step(lr);
     }
 
-    void train_step(const Tensor& token_ids, const Tensor& target_logits) {
+    void train_step(const Tensor& token_ids, const Tensor& target_logits, MeshDevice* dev = nullptr) {
         forward(token_ids);
-        compute_loss(target_logits);
+        compute_loss(target_logits, dev);  // Pass device to cache loss value
         backward(token_ids);
         sgd_step();
     }
 
     float get_loss(MeshDevice* dev) {
-        tt::tt_metal::distributed::Synchronize(dev, std::nullopt);
-        return static_cast<float>(loss.cpu().to_vector<bfloat16>()[0]);
+        (void)dev;  // Not needed, use cached value
+        return last_loss_value;
     }
 };
 

@@ -11,6 +11,7 @@
 // Usage:
 //   make bench-gpt2-full
 //   BENCH_LAYERS=6 make bench-gpt2-full-run
+// Note: ETH dispatch (64 cores) is now the default. Use USE_WORKER_DISPATCH=1 to revert to 56 cores.
 
 #include "traced/transformer_train.hpp"
 #include "common.hpp"
@@ -24,20 +25,30 @@
 
 using MeshDevice = tt::tt_metal::distributed::MeshDevice;
 using DispatchCoreConfig = tt::tt_metal::DispatchCoreConfig;
+using DispatchCoreType = tt::tt_metal::DispatchCoreType;
 using Tensor = tt::tt_metal::Tensor;
 
-// DeviceGuard with configurable trace region
+// DeviceGuard with configurable trace region and ETH dispatch (default ON for N300)
 struct ConfigurableDeviceGuard {
     std::shared_ptr<MeshDevice> device;
 
     ConfigurableDeviceGuard(size_t trace_region_mb)
-        : device(MeshDevice::create_unit_mesh(
-            0,
-            DEFAULT_L1_SMALL_SIZE,
-            trace_region_mb * 1024 * 1024,
-            1,
-            DispatchCoreConfig{}
-        )) {}
+        : device([trace_region_mb]() {
+            // Default to ETH dispatch for 8x8 grid on N300
+            // Set USE_WORKER_DISPATCH=1 to use WORKER dispatch (8x7 grid)
+            bool use_worker = std::getenv("USE_WORKER_DISPATCH") != nullptr;
+            return MeshDevice::create_unit_mesh(
+                0,
+                DEFAULT_L1_SMALL_SIZE,
+                trace_region_mb * 1024 * 1024,
+                1,
+                use_worker ? DispatchCoreConfig{}
+                           : DispatchCoreConfig{DispatchCoreType::ETH}
+            );
+        }()) {
+        auto grid = device->compute_with_storage_grid_size();
+        fmt::print("# Compute grid: {}x{} = {} cores\n", grid.x, grid.y, grid.x * grid.y);
+    }
 
     ~ConfigurableDeviceGuard() {
         tt::tt_metal::distributed::Finish(device->mesh_command_queue());
@@ -50,12 +61,12 @@ struct ConfigurableDeviceGuard {
 constexpr int N_WARMUP = 3;
 constexpr int N_ITERS = 10;
 
-// TTML nano_gpt defaults
+// Tile-aligned config: all dims must be multiples of 32, dim/heads must be multiple of 32
 constexpr uint32_t DEFAULT_VOCAB = 256;
 constexpr uint32_t DEFAULT_BATCH = 32;
 constexpr uint32_t DEFAULT_SEQ = 256;
-constexpr uint32_t DEFAULT_DIM = 384;
-constexpr uint32_t DEFAULT_HEADS = 6;
+constexpr uint32_t DEFAULT_DIM = 512;    // 512 = 8 heads * 64 head_dim (both tile-aligned)
+constexpr uint32_t DEFAULT_HEADS = 8;
 constexpr uint32_t DEFAULT_FFN_MULT = 4;
 constexpr uint32_t DEFAULT_LAYERS = 6;
 
@@ -72,7 +83,8 @@ Tensor create_random_tokens(uint32_t batch, uint32_t seq, uint32_t vocab, MeshDe
 
 template<size_t N>
 double benchmark_with_embedding(uint32_t batch, uint32_t seq, uint32_t dim, uint32_t heads,
-                                 uint32_t ffn_mult, uint32_t vocab, float lr, MeshDevice& dev) {
+                                 uint32_t ffn_mult, uint32_t vocab, float lr, MeshDevice& dev,
+                                 bool print_loss = false) {
     // Create random token input
     auto token_ids = create_random_tokens(batch, seq, vocab, dev);
 
@@ -88,15 +100,29 @@ double benchmark_with_embedding(uint32_t batch, uint32_t seq, uint32_t dim, uint
     }
     tt::tt_metal::distributed::Synchronize(&dev, std::nullopt);
 
-    // Timed runs
-    auto start = std::chrono::high_resolution_clock::now();
-    for (int i = 0; i < N_ITERS; ++i) {
-        model.train_step(token_ids, target);
+    // Print loss header if requested
+    if (print_loss) {
+        fmt::print("\n# Loss trajectory (step, loss, time_ms)\n");
     }
-    tt::tt_metal::distributed::Synchronize(&dev, std::nullopt);
-    auto end = std::chrono::high_resolution_clock::now();
 
-    return std::chrono::duration<double, std::milli>(end - start).count() / N_ITERS;
+    // Timed runs with optional loss tracking
+    double total_ms = 0.0;
+    for (int i = 0; i < N_ITERS; ++i) {
+        auto step_start = std::chrono::high_resolution_clock::now();
+        // Pass device when print_loss enabled so loss gets cached during compute_loss
+        model.train_step(token_ids, target, print_loss ? &dev : nullptr);
+        tt::tt_metal::distributed::Synchronize(&dev, std::nullopt);
+        auto step_end = std::chrono::high_resolution_clock::now();
+        double step_ms = std::chrono::duration<double, std::milli>(step_end - step_start).count();
+        total_ms += step_ms;
+
+        if (print_loss) {
+            float loss = model.get_loss(&dev);
+            fmt::print("{},{:.6f},{:.3f}\n", i, loss, step_ms);
+        }
+    }
+
+    return total_ms / N_ITERS;
 }
 
 int main() {
@@ -108,7 +134,7 @@ int main() {
     uint32_t ffn_mult = DEFAULT_FFN_MULT;
     uint32_t vocab = DEFAULT_VOCAB;
     uint32_t num_layers = DEFAULT_LAYERS;
-    float lr = 0.01f;
+    float lr = 0.01f;  // 0.01 shows visible loss decrease in BF16
     size_t trace_mb = 128;
 
     if (const char* env = std::getenv("BENCH_BATCH")) batch = std::stoul(env);
@@ -119,6 +145,7 @@ int main() {
     if (const char* env = std::getenv("BENCH_VOCAB")) vocab = std::stoul(env);
     if (const char* env = std::getenv("BENCH_LAYERS")) num_layers = std::stoul(env);
     if (const char* env = std::getenv("BENCH_TRACE_MB")) trace_mb = std::stoul(env);
+    bool print_loss = std::getenv("PRINT_LOSS") != nullptr;
 
     fmt::print("# Full GPT-2 Training Benchmark (with Embeddings)\n");
     fmt::print("# Config: batch={}, seq={}, dim={}, heads={}, ffn_mult={}, vocab={}, layers={}\n",
@@ -152,10 +179,10 @@ int main() {
     fmt::print("## Training step ({} layers, with embeddings)\n", num_layers);
     try {
         switch (num_layers) {
-            case 1: our_ms = benchmark_with_embedding<1>(batch, seq, dim, heads, ffn_mult, vocab, lr, device); break;
-            case 2: our_ms = benchmark_with_embedding<2>(batch, seq, dim, heads, ffn_mult, vocab, lr, device); break;
-            case 3: our_ms = benchmark_with_embedding<3>(batch, seq, dim, heads, ffn_mult, vocab, lr, device); break;
-            case 6: our_ms = benchmark_with_embedding<6>(batch, seq, dim, heads, ffn_mult, vocab, lr, device); break;
+            case 1: our_ms = benchmark_with_embedding<1>(batch, seq, dim, heads, ffn_mult, vocab, lr, device, print_loss); break;
+            case 2: our_ms = benchmark_with_embedding<2>(batch, seq, dim, heads, ffn_mult, vocab, lr, device, print_loss); break;
+            case 3: our_ms = benchmark_with_embedding<3>(batch, seq, dim, heads, ffn_mult, vocab, lr, device, print_loss); break;
+            case 6: our_ms = benchmark_with_embedding<6>(batch, seq, dim, heads, ffn_mult, vocab, lr, device, print_loss); break;
         }
         fmt::print("Our implementation: {:.3f} ms/step, {:.3f} ms/layer\n\n",
                    our_ms, our_ms / num_layers);

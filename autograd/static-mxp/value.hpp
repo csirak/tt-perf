@@ -110,10 +110,11 @@ struct Graph {
 #endif
         if (topo_order.empty() || root != r) {
             build_topo(r);
-            // Initialize root gradient to ones once (dL/dL = 1)
-            if (root->grad) {
-                *root->grad = ttnn::ones_like(*root->data);
-            }
+        }
+
+        // Initialize root gradient to ones each call (dL/dL = 1)
+        if (root && root->grad) {
+            *root->grad = ttnn::ones_like(*root->data);
         }
 
         // Mark root grad as initialized so it doesn't get overwritten

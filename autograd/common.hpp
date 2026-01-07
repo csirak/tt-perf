@@ -11,12 +11,14 @@
 #include <tt-metalium/host_api.hpp>
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
 #include <memory>
 
 namespace test {
 
 using MeshDevice = tt::tt_metal::distributed::MeshDevice;
 using DispatchCoreConfig = tt::tt_metal::DispatchCoreConfig;
+using DispatchCoreType = tt::tt_metal::DispatchCoreType;
 
 // RAII device guard - opens on construct, closes on destruct
 struct DeviceGuard {
@@ -27,14 +29,23 @@ struct DeviceGuard {
 
     // Note: 2 CQs don't help for TTNN ops (compute-bound, not dispatch-bound)
     // The 2-CQ speedup is only seen in minimal dispatch-overhead tests
+    // Default to ETH dispatch for 8x8 grid on N300
+    // Set USE_WORKER_DISPATCH=1 to use WORKER dispatch (8x7 grid)
     DeviceGuard(int num_cqs = 1)
-        : device(MeshDevice::create_unit_mesh(
-            0,                          // device_id
-            DEFAULT_L1_SMALL_SIZE,
-            TRACE_REGION_SIZE,
-            num_cqs,                    // num_command_queues
-            DispatchCoreConfig{}
-        )) {}
+        : device([num_cqs]() {
+            bool use_worker = std::getenv("USE_WORKER_DISPATCH") != nullptr;
+            return MeshDevice::create_unit_mesh(
+                0,                          // device_id
+                DEFAULT_L1_SMALL_SIZE,
+                TRACE_REGION_SIZE,
+                num_cqs,                    // num_command_queues
+                use_worker ? DispatchCoreConfig{}
+                           : DispatchCoreConfig{DispatchCoreType::ETH}
+            );
+        }()) {
+        auto grid = device->compute_with_storage_grid_size();
+        fmt::print("# Compute grid: {}x{} = {} cores\n", grid.x, grid.y, grid.x * grid.y);
+    }
 
     ~DeviceGuard() {
         Finish(device->mesh_command_queue());

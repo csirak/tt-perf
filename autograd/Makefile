@@ -7,7 +7,7 @@ TTNN_EXAMPLES := $(TT_METAL)/ttnn/examples
 AUTOGRAD_DIR := $(TTNN_EXAMPLES)/autograd
 
 .PHONY: all clean setup
-.PHONY: tensor matmul relu softmax linear sgd train mlp mlp-traced
+.PHONY: tensor typecast matmul relu softmax linear sgd train mlp mlp-traced
 .PHONY: core-grid core-grid-profile
 .PHONY: verify verify-sync verify-build verify-run verify-torch
 .PHONY: fidelity fidelity-sync fidelity-build fidelity-run
@@ -61,6 +61,20 @@ tensor-build:
 	cd $(BUILD_DIR) && ninja example_autograd
 
 tensor-run:
+	cd $(TT_METAL) && ./build_Release/ttnn/examples/example_autograd
+
+# === Test: Typecast BFP8 <-> BF16 ===
+typecast: typecast-sync typecast-build typecast-run
+
+typecast-sync:
+	mkdir -p $(AUTOGRAD_DIR)
+	cp common.hpp $(AUTOGRAD_DIR)/
+	cp tests/test_typecast.cpp $(AUTOGRAD_DIR)/main.cpp
+
+typecast-build:
+	cd $(BUILD_DIR) && ninja example_autograd
+
+typecast-run:
 	cd $(TT_METAL) && ./build_Release/ttnn/examples/example_autograd
 
 # === Test: Matmul forward/backward ===
@@ -206,6 +220,8 @@ PROFILER_LOGS := $(PROFILER_DIR)/.logs
 CAPTURE_BIN := $(BUILD_DIR)/tools/profiler/bin/capture-release
 CSVEXPORT_BIN := $(BUILD_DIR)/tools/profiler/bin/csvexport-release
 TRACY_PORT := 8086
+TT_METAL_DEVICE_PROFILER ?= 1
+TT_METAL_DEVICE_PROFILER_SYNC ?= 1
 
 mlp-profile: mlp-sync mlp-build
 	@echo "=== Tracy Profiling: MLP Training ==="
@@ -1034,3 +1050,335 @@ bench-gpt2-trace-build:
 
 bench-gpt2-trace-run:
 	cd $(TT_METAL) && ./build_Release/ttnn/examples/example_autograd
+
+# === GPT-2 Static Autograd Benchmark ===
+# Tests PersistentGPT2 (static_autograd) with trace API
+# This uses the correct pattern: Graph + Value* pointers to class member tensors
+# Usage: BENCH_LAYERS=6 make bench-gpt2-static
+.PHONY: bench-gpt2-static bench-gpt2-static-sync bench-gpt2-static-build bench-gpt2-static-run
+
+bench-gpt2-static: bench-gpt2-static-sync bench-gpt2-static-build bench-gpt2-static-run
+
+bench-gpt2-static-sync:
+	mkdir -p $(AUTOGRAD_DIR)/static
+	cp -r static/* $(AUTOGRAD_DIR)/static/
+	cp common.hpp $(AUTOGRAD_DIR)/
+	cp ../bench/autograd/bench_gpt2_static.cpp $(AUTOGRAD_DIR)/main.cpp
+
+bench-gpt2-static-build:
+	cd $(BUILD_DIR) && ninja example_autograd
+
+bench-gpt2-static-run:
+	cd $(TT_METAL) && ./build_Release/ttnn/examples/example_autograd
+
+# Profile BFP8 backward pass with Tracy
+.PHONY: bench-gpt2-static-profile
+
+bench-gpt2-static-profile: bench-gpt2-static-sync bench-gpt2-static-build
+	@echo "=== Tracy Profiling: GPT-2 BFP8 Backward Pass ==="
+	@mkdir -p $(PROFILER_LOGS)
+	@echo "Starting Tracy capture on port $(TRACY_PORT)..."
+	@$(CAPTURE_BIN) -o $(PROFILER_LOGS)/gpt2_backward.tracy -f -p $(TRACY_PORT) & \
+	CAPTURE_PID=$$!; \
+	sleep 2; \
+	echo "Running GPT-2 training with Tracy profiling..."; \
+	cd $(TT_METAL) && TT_METAL_DEVICE_PROFILER=1 TT_METAL_DEVICE_PROFILER_SYNC=1 TRACY_PORT=$(TRACY_PORT) \
+		./build_Release/ttnn/examples/example_autograd; \
+	sleep 1; \
+	kill $$CAPTURE_PID 2>/dev/null || true; \
+	wait $$CAPTURE_PID 2>/dev/null || true
+	@echo "Exporting to CSV..."
+	@$(CSVEXPORT_BIN) -u $(PROFILER_LOGS)/gpt2_backward.tracy \
+		> $(PROFILER_LOGS)/gpt2_backward.csv 2>/dev/null || true
+	@echo ""
+	@echo "=== Profiling Complete ==="
+	@echo "Tracy trace: $(PROFILER_LOGS)/gpt2_backward.tracy"
+	@echo "CSV output:  $(PROFILER_LOGS)/gpt2_backward.csv"
+	@echo ""
+	@echo "Key zones to check in CSV:"
+	@echo "  - graph_backward: Total backward pass time"
+	@echo "  - backward_fn: Individual backward function calls"
+	@echo "  - accumulate_grad: Gradient accumulation"
+	@echo "  - accumulate_grad_add: Allocating add (should be minimized)"
+	@echo "  - Linear3DBFP8_backward, LayerNormBFP8_backward: Layer-specific"
+	@echo "  - typecast_dout_bf16, ln_typecast_dout: BFP8->BF16 conversions"
+
+# === GPT-2 Forward+Backward Benchmark (BF16 only) ===
+# Simple benchmark for single step timing
+# Usage: BENCH_LAYERS=6 make bench-gpt2-fwd-back
+.PHONY: bench-gpt2-fwd-back bench-gpt2-fwd-back-sync bench-gpt2-fwd-back-build bench-gpt2-fwd-back-run
+
+bench-gpt2-fwd-back: bench-gpt2-fwd-back-sync bench-gpt2-fwd-back-build bench-gpt2-fwd-back-run
+
+bench-gpt2-fwd-back-sync:
+	mkdir -p $(AUTOGRAD_DIR)/static
+	cp -r static/* $(AUTOGRAD_DIR)/static/
+	cp common.hpp $(AUTOGRAD_DIR)/
+	cp ../bench/autograd/bench_gpt2_fwd_back.cpp $(AUTOGRAD_DIR)/main.cpp
+
+bench-gpt2-fwd-back-build:
+	cd $(BUILD_DIR) && ninja example_autograd
+
+bench-gpt2-fwd-back-run:
+	cd $(TT_METAL) && ./build_Release/ttnn/examples/example_autograd
+
+# === GPT-2 Mixed Precision Benchmark (BF16 Attn + BFP8 FFN) ===
+# Compares pure BF16 vs mixed precision training
+# Usage: BENCH_LAYERS=6 make bench-gpt2-fwd-back-mxp
+.PHONY: bench-gpt2-fwd-back-mxp bench-gpt2-fwd-back-mxp-sync bench-gpt2-fwd-back-mxp-build bench-gpt2-fwd-back-mxp-run
+
+bench-gpt2-fwd-back-mxp: bench-gpt2-fwd-back-mxp-sync bench-gpt2-fwd-back-mxp-build bench-gpt2-fwd-back-mxp-run
+
+bench-gpt2-fwd-back-mxp-sync:
+	mkdir -p $(AUTOGRAD_DIR)/static
+	cp -r static/* $(AUTOGRAD_DIR)/static/
+	cp common.hpp $(AUTOGRAD_DIR)/
+	cp ../bench/autograd/bench_gpt2_fwd_back_mxp.cpp $(AUTOGRAD_DIR)/main.cpp
+
+bench-gpt2-fwd-back-mxp-build:
+	cd $(BUILD_DIR) && ninja example_autograd
+
+bench-gpt2-fwd-back-mxp-run:
+	cd $(TT_METAL) && ./build_Release/ttnn/examples/example_autograd
+
+# Profile mixed precision with Tracy
+.PHONY: bench-gpt2-fwd-back-mxp-profile
+
+bench-gpt2-fwd-back-mxp-profile: bench-gpt2-fwd-back-mxp-sync bench-gpt2-fwd-back-mxp-build
+	@echo "=== Tracy Profiling: GPT-2 Mixed Precision ==="
+	@mkdir -p $(PROFILER_LOGS)
+	@echo "Starting Tracy capture on port $(TRACY_PORT)..."
+	@$(CAPTURE_BIN) -o $(PROFILER_LOGS)/gpt2_mxp.tracy -f -p $(TRACY_PORT) & \
+	CAPTURE_PID=$$!; \
+	sleep 2; \
+	echo "Running mixed precision benchmark with Tracy profiling..."; \
+	cd $(TT_METAL) && TT_METAL_DEVICE_PROFILER=1 TT_METAL_DEVICE_PROFILER_SYNC=1 TRACY_PORT=$(TRACY_PORT) \
+		./build_Release/ttnn/examples/example_autograd; \
+	sleep 1; \
+	kill $$CAPTURE_PID 2>/dev/null || true; \
+	wait $$CAPTURE_PID 2>/dev/null || true
+	@echo "Exporting to CSV..."
+	@$(CSVEXPORT_BIN) -u $(PROFILER_LOGS)/gpt2_mxp.tracy \
+		> $(PROFILER_LOGS)/gpt2_mxp.csv 2>/dev/null || true
+	@echo ""
+	@echo "=== Profiling Complete ==="
+	@echo "Tracy trace: $(PROFILER_LOGS)/gpt2_mxp.tracy"
+	@echo "CSV output:  $(PROFILER_LOGS)/gpt2_mxp.csv"
+
+# === GPT-2 MXP TensorGroup Benchmark ===
+# Tests PersistentGPT2MXP with batched typecast via TypecastCache
+# Compares BFP8 (inline typecast) vs MXP (batched typecast)
+# Usage: BENCH_LAYERS=6 make bench-gpt2-mxp-tgroup
+.PHONY: bench-gpt2-mxp-tgroup bench-gpt2-mxp-tgroup-sync bench-gpt2-mxp-tgroup-build bench-gpt2-mxp-tgroup-run
+
+bench-gpt2-mxp-tgroup: bench-gpt2-mxp-tgroup-sync bench-gpt2-mxp-tgroup-build bench-gpt2-mxp-tgroup-run
+
+bench-gpt2-mxp-tgroup-sync:
+	mkdir -p $(AUTOGRAD_DIR)/static-mxp
+	cp -r static-mxp/* $(AUTOGRAD_DIR)/static-mxp/
+	cp common.hpp $(AUTOGRAD_DIR)/
+	cp ../bench/autograd/bench_gpt2_fwd_back_mxp_tgroup.cpp $(AUTOGRAD_DIR)/main.cpp
+
+bench-gpt2-mxp-tgroup-build:
+	cd $(BUILD_DIR) && ninja example_autograd
+
+bench-gpt2-mxp-tgroup-run:
+	cd $(TT_METAL) && ./build_Release/ttnn/examples/example_autograd
+
+# Profile MXP TensorGroup with Tracy
+.PHONY: bench-gpt2-mxp-tgroup-profile
+
+bench-gpt2-mxp-tgroup-profile: bench-gpt2-mxp-tgroup-sync bench-gpt2-mxp-tgroup-build
+	@echo "=== Tracy Profiling: GPT-2 MXP TensorGroup ==="
+	@mkdir -p $(PROFILER_LOGS)
+	@echo "Starting Tracy capture on port $(TRACY_PORT)..."
+	@$(CAPTURE_BIN) -o $(PROFILER_LOGS)/gpt2_mxp_tgroup.tracy -f -p $(TRACY_PORT) & \
+	CAPTURE_PID=$$!; \
+	sleep 2; \
+	echo "Running MXP TensorGroup benchmark with Tracy profiling..."; \
+	cd $(TT_METAL) && TT_METAL_DEVICE_PROFILER=1 TT_METAL_DEVICE_PROFILER_SYNC=1 TRACY_PORT=$(TRACY_PORT) \
+		./build_Release/ttnn/examples/example_autograd; \
+	sleep 1; \
+	kill $$CAPTURE_PID 2>/dev/null || true; \
+	wait $$CAPTURE_PID 2>/dev/null || true
+	@echo "Exporting to CSV..."
+	@$(CSVEXPORT_BIN) -u $(PROFILER_LOGS)/gpt2_mxp_tgroup.tracy \
+		> $(PROFILER_LOGS)/gpt2_mxp_tgroup.csv 2>/dev/null || true
+	@echo ""
+	@echo "=== Profiling Complete ==="
+	@echo "Tracy trace: $(PROFILER_LOGS)/gpt2_mxp_tgroup.tracy"
+	@echo "CSV output:  $(PROFILER_LOGS)/gpt2_mxp_tgroup.csv"
+
+# === PyTorch Benchmarks on adam (CUDA) ===
+# Run via SSH from howard to adam
+ADAM := adam
+ADAM_DIR := ~/ttnn-perf
+CUDA_RESULTS := ../bench/reports/cuda
+
+.PHONY: bench-gpt2-torch bench-gpt2-torch-run
+
+# Run GPT-2 PyTorch on adam (CUDA), save results to howard
+bench-gpt2-torch: bench-gpt2-torch-run
+
+bench-gpt2-torch-run:
+	@mkdir -p $(CUDA_RESULTS)
+	ssh $(ADAM) "cd $(ADAM_DIR) && source .venv/bin/activate && python3 bench/gpt2_torch.py" 2>&1 | tee $(CUDA_RESULTS)/gpt2_torch.txt
+	@echo ""
+	@echo "Results saved to $(CUDA_RESULTS)/gpt2_torch.txt"
+
+# === Forward Pass Verification (C++ Traced Autograd vs PyTorch) ===
+# Compares our C++ traced autograd outputs against PyTorch BF16 reference
+# Uses file-based serialization for exact numerical comparison
+#
+# Usage:
+#   make verify-attention          # Full pipeline: generate + run + compare
+#   make verify-attention-pytorch  # Generate PyTorch reference only
+#   make verify-attention-cpp      # Build and run C++ only
+#   make verify-attention-compare  # Compare outputs only
+#
+VERIFY_DIR := ../verify
+
+.PHONY: verify-attention verify-attention-pytorch verify-attention-cpp verify-attention-build verify-attention-run verify-attention-compare
+
+# Full verification pipeline
+verify-attention: verify-attention-pytorch verify-attention-cpp verify-attention-compare
+
+# Generate PyTorch reference outputs
+verify-attention-pytorch:
+	@echo "=== Generating PyTorch reference outputs ==="
+	cd .. && python3 verify/gen_pytorch_outputs.py
+
+# Build and run C++ verification
+verify-attention-cpp: verify-attention-sync verify-attention-build verify-attention-run
+
+verify-attention-sync:
+	mkdir -p $(AUTOGRAD_DIR)/traced
+	cp -r traced/* $(AUTOGRAD_DIR)/traced/
+	cp common.hpp $(AUTOGRAD_DIR)/
+	cp $(VERIFY_DIR)/verify_attention.cpp $(AUTOGRAD_DIR)/main.cpp
+
+verify-attention-build:
+	cd $(BUILD_DIR) && ninja example_autograd
+
+verify-attention-run:
+	@echo "=== Running C++ traced autograd forward ==="
+	cd ~/ttnn-perf && TT_METAL_HOME=~/tt-metal TT_METAL_RUNTIME_ROOT=~/tt-metal ~/tt-metal/build_Release/ttnn/examples/example_autograd
+
+# Compare outputs
+verify-attention-compare:
+	@echo "=== Comparing C++ vs PyTorch outputs ==="
+	cd .. && python3 verify/compare_outputs.py
+
+# === FP32 Accumulation Ablation ===
+# Compares attention forward with fp32_dest_acc_en=true vs PyTorch
+#
+# Usage:
+#   make verify-attention-fp32acc          # Full pipeline
+#   make verify-attention-fp32acc-cpp      # Build and run C++ only
+#   make verify-attention-fp32acc-compare  # Compare outputs only
+#
+.PHONY: verify-attention-fp32acc verify-attention-fp32acc-cpp verify-attention-fp32acc-sync verify-attention-fp32acc-run verify-attention-fp32acc-compare
+
+# Full verification pipeline with FP32 accumulation
+verify-attention-fp32acc: verify-attention-pytorch verify-attention-fp32acc-cpp verify-attention-fp32acc-compare
+
+# Build and run C++ verification with FP32 accumulation
+verify-attention-fp32acc-cpp: verify-attention-fp32acc-sync verify-attention-build verify-attention-fp32acc-run
+
+verify-attention-fp32acc-sync:
+	mkdir -p $(AUTOGRAD_DIR)/traced
+	cp -r traced/* $(AUTOGRAD_DIR)/traced/
+	cp common.hpp $(AUTOGRAD_DIR)/
+	cp $(VERIFY_DIR)/verify_attention_fp32acc.cpp $(AUTOGRAD_DIR)/main.cpp
+
+verify-attention-fp32acc-run:
+	@echo "=== Running C++ traced autograd forward (FP32 ACC) ==="
+	cd ~/ttnn-perf && TT_METAL_HOME=~/tt-metal TT_METAL_RUNTIME_ROOT=~/tt-metal ~/tt-metal/build_Release/ttnn/examples/example_autograd
+
+# Compare FP32 accumulation outputs
+verify-attention-fp32acc-compare:
+	@echo "=== Comparing C++ (FP32 acc) vs PyTorch outputs ==="
+	cd .. && python3 verify/compare_outputs.py --cpp-dir verify/outputs/cpp_fp32acc
+
+# === Per-Layer Timing ===
+# Measures actual TFLOPS for each attention layer
+#
+# Usage:
+#   make verify-attention-timed
+#
+.PHONY: verify-attention-timed verify-attention-timed-sync verify-attention-timed-run
+
+verify-attention-timed: verify-attention-timed-sync verify-attention-build verify-attention-timed-run
+
+verify-attention-timed-sync:
+	mkdir -p $(AUTOGRAD_DIR)/traced
+	cp -r traced/* $(AUTOGRAD_DIR)/traced/
+	cp common.hpp $(AUTOGRAD_DIR)/
+	cp $(VERIFY_DIR)/verify_attention_timed.cpp $(AUTOGRAD_DIR)/main.cpp
+
+verify-attention-timed-run:
+	@echo "=== Running C++ attention timing ==="
+	cd ~/ttnn-perf && TT_METAL_HOME=~/tt-metal TT_METAL_RUNTIME_ROOT=~/tt-metal ~/tt-metal/build_Release/ttnn/examples/example_autograd
+
+# === SDPA vs Manual Attention Comparison ===
+# Compare fused SDPA kernel against our manual implementation
+# Usage:
+#   make verify-attention-sdpa
+#
+.PHONY: verify-attention-sdpa verify-attention-sdpa-sync verify-attention-sdpa-run
+
+verify-attention-sdpa: verify-attention-pytorch verify-attention-sdpa-sync verify-attention-build verify-attention-sdpa-run
+
+verify-attention-sdpa-sync:
+	mkdir -p $(AUTOGRAD_DIR)/traced
+	cp -r traced/* $(AUTOGRAD_DIR)/traced/
+	cp common.hpp $(AUTOGRAD_DIR)/
+	cp $(VERIFY_DIR)/verify_attention_sdpa.cpp $(AUTOGRAD_DIR)/main.cpp
+
+verify-attention-sdpa-run:
+	@echo "=== Running SDPA vs Manual comparison ==="
+	cd ~/ttnn-perf && TT_METAL_HOME=~/tt-metal TT_METAL_RUNTIME_ROOT=~/tt-metal ~/tt-metal/build_Release/ttnn/examples/example_autograd
+
+# === GPT-2 MXP2 Benchmark: Batched Weight Typecast ===
+# Tests PersistentGPT2MXP2 with batched weight typecast after SGD
+# Compares MXP (inline weight typecast) vs MXP2 (batched weight typecast)
+# Usage: BENCH_LAYERS=6 make bench-gpt2-mxp2
+.PHONY: bench-gpt2-mxp2 bench-gpt2-mxp2-sync bench-gpt2-mxp2-build bench-gpt2-mxp2-run
+
+bench-gpt2-mxp2: bench-gpt2-mxp2-sync bench-gpt2-mxp2-build bench-gpt2-mxp2-run
+
+bench-gpt2-mxp2-sync:
+	mkdir -p $(AUTOGRAD_DIR)/static-mxp
+	cp -r static-mxp/* $(AUTOGRAD_DIR)/static-mxp/
+	cp common.hpp $(AUTOGRAD_DIR)/
+	cp ../bench/autograd/bench_gpt2_mxp2.cpp $(AUTOGRAD_DIR)/main.cpp
+
+bench-gpt2-mxp2-build:
+	cd $(BUILD_DIR) && ninja example_autograd
+
+bench-gpt2-mxp2-run:
+	cd $(TT_METAL) && ./build_Release/ttnn/examples/example_autograd
+
+# Profile MXP2 with Tracy
+.PHONY: bench-gpt2-mxp2-profile
+
+bench-gpt2-mxp2-profile: bench-gpt2-mxp2-sync bench-gpt2-mxp2-build
+	@echo "=== Tracy Profiling: GPT-2 MXP2 (Batched Weight Typecast) ==="
+	@mkdir -p $(PROFILER_LOGS)
+	@echo "Starting Tracy capture on port $(TRACY_PORT)..."
+	@$(CAPTURE_BIN) -o $(PROFILER_LOGS)/gpt2_mxp2.tracy -f -p $(TRACY_PORT) & \
+	CAPTURE_PID=$$!; \
+	sleep 2; \
+	echo "Running MXP2 benchmark with Tracy profiling..."; \
+	cd $(TT_METAL) && TT_METAL_DEVICE_PROFILER=$(TT_METAL_DEVICE_PROFILER) TT_METAL_DEVICE_PROFILER_SYNC=$(TT_METAL_DEVICE_PROFILER_SYNC) TRACY_PORT=$(TRACY_PORT) \
+		./build_Release/ttnn/examples/example_autograd; \
+	sleep 1; \
+	kill $$CAPTURE_PID 2>/dev/null || true; \
+	wait $$CAPTURE_PID 2>/dev/null || true
+	@echo "Exporting to CSV..."
+	@$(CSVEXPORT_BIN) -u $(PROFILER_LOGS)/gpt2_mxp2.tracy \
+		> $(PROFILER_LOGS)/gpt2_mxp2.csv 2>/dev/null || true
+	@echo ""
+	@echo "=== Profiling Complete ==="
+	@echo "Tracy trace: $(PROFILER_LOGS)/gpt2_mxp2.tracy"
+	@echo "CSV output:  $(PROFILER_LOGS)/gpt2_mxp2.csv"

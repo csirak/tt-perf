@@ -1336,3 +1336,25 @@ bench-gpt2-mxp2-profile: bench-gpt2-mxp2-sync bench-gpt2-mxp2-build
 	@echo "Tracy trace: $(PROFILER_LOGS)/gpt2_mxp2.tracy"
 	@echo "CSV output:  $(PROFILER_LOGS)/gpt2_mxp2.csv"
 
+# === Grokking: Modular Division Experiment ===
+# Usage: GROK_CONFIG=~/ttnn-perf/experiments/grok/default.yaml make grok-train
+
+grok-train: grok-train-sync grok-train-build grok-train-run
+
+grok-train-sync:
+	mkdir -p $(AUTOGRAD_DIR)/autograd
+	mkdir -p $(AUTOGRAD_DIR)/data
+	mkdir -p $(AUTOGRAD_DIR)/utils
+	cp -r nn $(AUTOGRAD_DIR)/autograd/
+	cp -r utils $(AUTOGRAD_DIR)/autograd/
+	cp ops.hpp tensor_group.hpp value.hpp nn.hpp $(AUTOGRAD_DIR)/autograd/
+	cp common.hpp $(AUTOGRAD_DIR)/
+	cp ../data/grok.hpp ../data/grok.cpp $(AUTOGRAD_DIR)/data/
+	cp ../bench/autograd/train_grok.cpp $(AUTOGRAD_DIR)/main.cpp
+
+grok-train-build:
+	cd $(BUILD_DIR) && ninja example_autograd
+
+grok-train-run:
+	cd $(TT_METAL) && ./build_Release/ttnn/examples/example_autograd
+

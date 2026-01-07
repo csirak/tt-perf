@@ -1,0 +1,15 @@
+# Grokking (modular division) config
+p: 127
+train_frac: 0.5
+pad_to: 32
+batch_size: 256
+steps: 200
+log_every: 10
+eval_every: 50
+seed: 0
+lr: 0.001
+dim: 128
+heads: 4
+ffn_mult: 4
+layers: 2
+csv: /home/howard/ttnn-perf/results/grok_default.csv

@@ -6,6 +6,38 @@ BUILD_DIR := $(TT_METAL)/build_Release
 TTNN_EXAMPLES := $(TT_METAL)/ttnn/examples
 AUTOGRAD_DIR := $(TTNN_EXAMPLES)/autograd
 
+.PHONY: all clean setup
+.PHONY: tensor typecast matmul relu softmax linear sgd train mlp mlp-traced
+.PHONY: core-grid core-grid-profile
+.PHONY: verify verify-sync verify-build verify-run verify-torch
+.PHONY: fidelity fidelity-sync fidelity-build fidelity-run
+.PHONY: traced-mlp traced-mlp-sync traced-mlp-build traced-mlp-run
+.PHONY: bench-mlp bench-mlp-sync bench-mlp-build bench-mlp-run
+.PHONY: bench-autograd bench-autograd-sync bench-autograd-build bench-autograd-run
+.PHONY: attention attention-sync attention-build attention-run
+.PHONY: static-autograd static-autograd-sync static-autograd-build static-autograd-run
+.PHONY: bench-static-trace bench-static-trace-sync bench-static-trace-build bench-static-trace-run bench-static-trace-profile
+.PHONY: bench-traced-trace bench-traced-trace-sync bench-traced-trace-build bench-traced-trace-run bench-traced-trace-profile
+.PHONY: bench-fusion bench-fusion-sync bench-fusion-build bench-fusion-run
+.PHONY: bench-fusion-fwd bench-fusion-fwd-sync bench-fusion-fwd-build bench-fusion-fwd-run
+.PHONY: bench-core-grid bench-core-grid-sync bench-core-grid-build bench-core-grid-run
+.PHONY: bench-congestion bench-congestion-sync bench-congestion-build bench-congestion-run
+.PHONY: bench-multicast bench-multicast-sync bench-multicast-build bench-multicast-run
+.PHONY: bench-parallel-subdevice bench-parallel-subdevice-sync bench-parallel-subdevice-build bench-parallel-subdevice-run
+.PHONY: bench-minimal bench-minimal-sync bench-minimal-build bench-minimal-run bench-minimal-noc
+.PHONY: bench-fullgrid bench-fullgrid-sync bench-fullgrid-build bench-fullgrid-run bench-fullgrid-noc
+.PHONY: bench-partitioned bench-partitioned-sync bench-partitioned-build bench-partitioned-run bench-partitioned-noc
+.PHONY: bench-7x2x4 bench-7x2x4-sync bench-7x2x4-build bench-7x2x4-run bench-7x2x4-noc
+.PHONY: bench-fullgrid-small bench-fullgrid-small-sync bench-fullgrid-small-build bench-fullgrid-small-run
+.PHONY: bench-4x2x4-uniform bench-4x2x4-uniform-sync bench-4x2x4-uniform-build bench-4x2x4-uniform-run bench-4x2x4-uniform-noc
+.PHONY: bench-7x2x4-uniform bench-7x2x4-uniform-sync bench-7x2x4-uniform-build bench-7x2x4-uniform-run bench-7x2x4-uniform-noc
+.PHONY: bench-matmul-compare bench-matmul-compare-sync bench-matmul-compare-build bench-matmul-compare-run bench-matmul-compare-noc bench-matmul-compare-profile
+.PHONY: bench-matmul-parallel-cq bench-matmul-parallel-cq-sync bench-matmul-parallel-cq-build bench-matmul-parallel-cq-run
+.PHONY: bench-matmul-traced bench-matmul-traced-sync bench-matmul-traced-build bench-matmul-traced-run
+.PHONY: bench-partition-sweep bench-partition-sweep-sync bench-partition-sweep-build bench-partition-sweep-run
+.PHONY: bench-transformer-depth bench-transformer-depth-sync bench-transformer-depth-build bench-transformer-depth-run
+.PHONY: bench-gpt2-small bench-gpt2-small-sync bench-gpt2-small-build bench-gpt2-small-run bench-gpt2-small-noc
+.PHONY: mesh mesh-sync mesh-build mesh-run
 
 # Default target
 all: tensor
@@ -966,6 +998,7 @@ clean:
 
 # === Transformer Training Benchmark: full training step (forward + backward + SGD) ===
 # Usage: BENCH_BATCH=32 BENCH_SEQ=256 BENCH_DIM=384 BENCH_HEADS=6 BENCH_LAYERS=6 make bench-transformer-train
+.PHONY: bench-transformer-train bench-transformer-train-sync bench-transformer-train-build bench-transformer-train-run
 
 bench-transformer-train: bench-transformer-train-sync bench-transformer-train-build bench-transformer-train-run
 
@@ -983,6 +1016,7 @@ bench-transformer-train-run:
 
 # === Full GPT-2 Benchmark (with embeddings) - Fair TTML comparison ===
 # Usage: BENCH_LAYERS=6 make bench-gpt2-full
+.PHONY: bench-gpt2-full bench-gpt2-full-sync bench-gpt2-full-build bench-gpt2-full-run
 
 bench-gpt2-full: bench-gpt2-full-sync bench-gpt2-full-build bench-gpt2-full-run
 
@@ -1001,6 +1035,7 @@ bench-gpt2-full-run:
 # === GPT-2 Static vs Traced Benchmark ===
 # Compares static (non-traced) vs traced execution for full GPT-2 with embeddings
 # Usage: BENCH_LAYERS=6 make bench-gpt2-trace
+.PHONY: bench-gpt2-trace bench-gpt2-trace-sync bench-gpt2-trace-build bench-gpt2-trace-run
 
 bench-gpt2-trace: bench-gpt2-trace-sync bench-gpt2-trace-build bench-gpt2-trace-run
 
@@ -1020,6 +1055,7 @@ bench-gpt2-trace-run:
 # Tests PersistentGPT2 (static_autograd) with trace API
 # This uses the correct pattern: Graph + Value* pointers to class member tensors
 # Usage: BENCH_LAYERS=6 make bench-gpt2-static
+.PHONY: bench-gpt2-static bench-gpt2-static-sync bench-gpt2-static-build bench-gpt2-static-run
 
 bench-gpt2-static: bench-gpt2-static-sync bench-gpt2-static-build bench-gpt2-static-run
 
@@ -1036,6 +1072,7 @@ bench-gpt2-static-run:
 	cd $(TT_METAL) && ./build_Release/ttnn/examples/example_autograd
 
 # Profile BFP8 backward pass with Tracy
+.PHONY: bench-gpt2-static-profile
 
 bench-gpt2-static-profile: bench-gpt2-static-sync bench-gpt2-static-build
 	@echo "=== Tracy Profiling: GPT-2 BFP8 Backward Pass ==="
@@ -1069,6 +1106,7 @@ bench-gpt2-static-profile: bench-gpt2-static-sync bench-gpt2-static-build
 # === GPT-2 Forward+Backward Benchmark (BF16 only) ===
 # Simple benchmark for single step timing
 # Usage: BENCH_LAYERS=6 make bench-gpt2-fwd-back
+.PHONY: bench-gpt2-fwd-back bench-gpt2-fwd-back-sync bench-gpt2-fwd-back-build bench-gpt2-fwd-back-run
 
 bench-gpt2-fwd-back: bench-gpt2-fwd-back-sync bench-gpt2-fwd-back-build bench-gpt2-fwd-back-run
 
@@ -1087,6 +1125,7 @@ bench-gpt2-fwd-back-run:
 # === GPT-2 Mixed Precision Benchmark (BF16 Attn + BFP8 FFN) ===
 # Compares pure BF16 vs mixed precision training
 # Usage: BENCH_LAYERS=6 make bench-gpt2-fwd-back-mxp
+.PHONY: bench-gpt2-fwd-back-mxp bench-gpt2-fwd-back-mxp-sync bench-gpt2-fwd-back-mxp-build bench-gpt2-fwd-back-mxp-run
 
 bench-gpt2-fwd-back-mxp: bench-gpt2-fwd-back-mxp-sync bench-gpt2-fwd-back-mxp-build bench-gpt2-fwd-back-mxp-run
 
@@ -1103,6 +1142,7 @@ bench-gpt2-fwd-back-mxp-run:
 	cd $(TT_METAL) && ./build_Release/ttnn/examples/example_autograd
 
 # Profile mixed precision with Tracy
+.PHONY: bench-gpt2-fwd-back-mxp-profile
 
 bench-gpt2-fwd-back-mxp-profile: bench-gpt2-fwd-back-mxp-sync bench-gpt2-fwd-back-mxp-build
 	@echo "=== Tracy Profiling: GPT-2 Mixed Precision ==="
@@ -1129,6 +1169,7 @@ bench-gpt2-fwd-back-mxp-profile: bench-gpt2-fwd-back-mxp-sync bench-gpt2-fwd-bac
 # Tests PersistentGPT2MXP with batched typecast via TypecastCache
 # Compares BFP8 (inline typecast) vs MXP (batched typecast)
 # Usage: BENCH_LAYERS=6 make bench-gpt2-mxp-tgroup
+.PHONY: bench-gpt2-mxp-tgroup bench-gpt2-mxp-tgroup-sync bench-gpt2-mxp-tgroup-build bench-gpt2-mxp-tgroup-run
 
 bench-gpt2-mxp-tgroup: bench-gpt2-mxp-tgroup-sync bench-gpt2-mxp-tgroup-build bench-gpt2-mxp-tgroup-run
 
@@ -1145,6 +1186,7 @@ bench-gpt2-mxp-tgroup-run:
 	cd $(TT_METAL) && ./build_Release/ttnn/examples/example_autograd
 
 # Profile MXP TensorGroup with Tracy
+.PHONY: bench-gpt2-mxp-tgroup-profile
 
 bench-gpt2-mxp-tgroup-profile: bench-gpt2-mxp-tgroup-sync bench-gpt2-mxp-tgroup-build
 	@echo "=== Tracy Profiling: GPT-2 MXP TensorGroup ==="
@@ -1173,6 +1215,7 @@ ADAM := adam
 ADAM_DIR := ~/ttnn-perf
 CUDA_RESULTS := ../bench/reports/cuda
 
+.PHONY: bench-gpt2-torch bench-gpt2-torch-run
 
 # Run GPT-2 PyTorch on adam (CUDA), save results to howard
 bench-gpt2-torch: bench-gpt2-torch-run
@@ -1195,6 +1238,7 @@ bench-gpt2-torch-run:
 #
 VERIFY_DIR := ../verify
 
+.PHONY: verify-attention verify-attention-pytorch verify-attention-cpp verify-attention-build verify-attention-run verify-attention-compare
 
 # Full verification pipeline
 verify-attention: verify-attention-pytorch verify-attention-cpp verify-attention-compare
@@ -1233,6 +1277,7 @@ verify-attention-compare:
 #   make verify-attention-fp32acc-cpp      # Build and run C++ only
 #   make verify-attention-fp32acc-compare  # Compare outputs only
 #
+.PHONY: verify-attention-fp32acc verify-attention-fp32acc-cpp verify-attention-fp32acc-sync verify-attention-fp32acc-run verify-attention-fp32acc-compare
 
 # Full verification pipeline with FP32 accumulation
 verify-attention-fp32acc: verify-attention-pytorch verify-attention-fp32acc-cpp verify-attention-fp32acc-compare
@@ -1261,6 +1306,7 @@ verify-attention-fp32acc-compare:
 # Usage:
 #   make verify-attention-timed
 #
+.PHONY: verify-attention-timed verify-attention-timed-sync verify-attention-timed-run
 
 verify-attention-timed: verify-attention-timed-sync verify-attention-build verify-attention-timed-run
 
@@ -1279,6 +1325,7 @@ verify-attention-timed-run:
 # Usage:
 #   make verify-attention-sdpa
 #
+.PHONY: verify-attention-sdpa verify-attention-sdpa-sync verify-attention-sdpa-run
 
 verify-attention-sdpa: verify-attention-pytorch verify-attention-sdpa-sync verify-attention-build verify-attention-sdpa-run
 
@@ -1296,6 +1343,7 @@ verify-attention-sdpa-run:
 # Tests PersistentGPT2MXP2 with batched weight typecast after SGD
 # Compares MXP (inline weight typecast) vs MXP2 (batched weight typecast)
 # Usage: BENCH_LAYERS=6 make bench-gpt2-mxp2
+.PHONY: bench-gpt2-mxp2 bench-gpt2-mxp2-sync bench-gpt2-mxp2-build bench-gpt2-mxp2-run
 
 bench-gpt2-mxp2: bench-gpt2-mxp2-sync bench-gpt2-mxp2-build bench-gpt2-mxp2-run
 
@@ -1312,6 +1360,7 @@ bench-gpt2-mxp2-run:
 	cd $(TT_METAL) && ./build_Release/ttnn/examples/example_autograd
 
 # Profile MXP2 with Tracy
+.PHONY: bench-gpt2-mxp2-profile
 
 bench-gpt2-mxp2-profile: bench-gpt2-mxp2-sync bench-gpt2-mxp2-build
 	@echo "=== Tracy Profiling: GPT-2 MXP2 (Batched Weight Typecast) ==="

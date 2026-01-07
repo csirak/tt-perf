@@ -1,0 +1,31 @@
+name,src_file,src_line,total_ns,total_perc,counts,mean_ns,min_ns,max_ns,std_ns
+initialize,/home/howard/tt-metal/tt_metal/impl/device/device_manager.cpp,228,10606168,0.021971,1,10606168,10606168,10606168,0.000000
+CreateDevices,/home/howard/tt-metal/tt_metal/tt_metal.cpp,376,377090502,0.781166,1,377090502,377090502,377090502,0.000000
+DeviceManager,/home/howard/tt-metal/tt_metal/impl/device/device_manager.cpp,762,2020,0.000004,1,2020,2020,2020,0.000000
+Device,/home/howard/tt-metal/tt_metal/impl/device/device.cpp,91,6819670,0.014127,1,6819670,6819670,6819670,0.000000
+writeToCoreControlBuffer,/home/howard/tt-metal/tt_metal/impl/profiler/profiler.cpp,1021,3723699,0.007714,160,23273,12230,120309,18550.639301
+build_firmware,/home/howard/tt-metal/tt_metal/jit_build/build_env_manager.cpp,217,121739719,0.252191,1,121739719,121739719,121739719,0.000000
+reset_cores,/home/howard/tt-metal/tt_metal/impl/context/metal_context.cpp,788,16887770,0.034984,2,8443885,7454928,9432842,1398596.402004
+initialize_allocator,/home/howard/tt-metal/tt_metal/impl/device/device.cpp,169,5921682,0.012267,1,5921682,5921682,5921682,0.000000
+GetCoreRangeSet,/home/howard/tt-metal/tt_metal/tt_metal.cpp,70,332190,0.000688,252,1318,250,29110,2677.292076
+DeviceProfiler,/home/howard/tt-metal/tt_metal/impl/profiler/profiler.cpp,1782,77620,0.000161,1,77620,77620,77620,0.000000
+ConfigureDeviceWithProgram,/home/howard/tt-metal/tt_metal/tt_metal.cpp,815,323919,0.000671,1,323919,323919,323919,0.000000
+SetRuntimeArgs,/home/howard/tt-metal/tt_metal/tt_metal.cpp,1391,3273762,0.006782,988,3313,1160,93540,4970.713232
+initialize_firmware,/home/howard/tt-metal/tt_metal/impl/context/metal_context.cpp,1095,137475848,0.284790,160,859224,205939,2093234,613416.728724
+FDMeshCommandQueue::finish_nolock,/home/howard/tt-metal/tt_metal/distributed/fd_mesh_command_queue.cpp,493,6724331,0.013930,20,336216,212490,1377876,251045.456081
+ProfilerSync,/home/howard/tt-metal/tt_metal/impl/profiler/tt_metal_profiler.cpp,572,450,0.000001,1,450,450,450,0.000000
+initialize_and_launch_firmware,/home/howard/tt-metal/tt_metal/impl/context/metal_context.cpp,1453,169742217,0.351632,2,84871108,31741366,138000851,75136802.408890
+CommandQueue_constructor,/home/howard/tt-metal/tt_metal/impl/dispatch/hardware_command_queue.cpp,103,698528,0.001447,1,698528,698528,698528,0.000000
+HWCommandQueue_destructor,/home/howard/tt-metal/tt_metal/impl/dispatch/hardware_command_queue.cpp,204,629598,0.001304,1,629598,629598,629598,0.000000
+get_physical_architecture,/home/howard/tt-metal/tt_metal/llrt/get_platform_architecture.hpp,20,290659,0.000602,2,145329,8040,282619,194156.672873
+convert_layout_tile_nfaces_to_row_major,/home/howard/tt-metal/tt_metal/impl/data_format/tilize_utils.cpp,347,146049,0.000303,20,7302,3660,51980,11082.973535
+Cluster,/home/howard/tt-metal/tt_metal/llrt/tt_cluster.cpp,213,22501671398,46.613604,1,22501671398,22501671398,22501671398,0.000000
+InitDeviceProfiler,/home/howard/tt-metal/tt_metal/impl/profiler/tt_metal_profiler.cpp,679,17754057,0.036779,1,17754057,17754057,17754057,0.000000
+teardown,/home/howard/tt-metal/tt_metal/impl/context/metal_context.cpp,291,11528976,0.023883,1,11528976,11528976,11528976,0.000000
+SetCommonRuntimeArgs,/home/howard/tt-metal/tt_metal/tt_metal.cpp,1415,2710,0.000006,8,338,220,510,115.938407
+initialize,/home/howard/tt-metal/tt_metal/impl/context/metal_context.cpp,97,366409104,0.759039,1,366409104,366409104,366409104,0.000000
+FW builds and Device Inits,/home/howard/tt-metal/tt_metal/impl/context/metal_context.cpp,184,148585559,0.307804,1,148585559,148585559,148585559,0.000000
+Resets and FW Launch,/home/howard/tt-metal/tt_metal/impl/context/metal_context.cpp,256,149875856,0.310477,1,149875856,149875856,149875856,0.000000
+initialize,/home/howard/tt-metal/tt_metal/impl/device/device.cpp,405,6818710,0.014125,1,6818710,6818710,6818710,0.000000
+WriteRuntimeArgsToDevice,/home/howard/tt-metal/tt_metal/tt_metal.cpp,885,477329,0.000989,1,477329,477329,477329,0.000000
+WriteToDeviceL1,/home/howard/tt-metal/tt_metal/tt_metal.cpp,296,289289,0.000599,19,15225,8880,36360,7503.818680

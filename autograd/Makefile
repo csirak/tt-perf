@@ -1350,7 +1350,7 @@ grok-train-sync:
 	cp ops.hpp tensor_group.hpp value.hpp nn.hpp $(AUTOGRAD_DIR)/autograd/
 	cp common.hpp $(AUTOGRAD_DIR)/
 	cp ../data/grok.hpp ../data/grok.cpp $(AUTOGRAD_DIR)/data/
-	cp ../bench/autograd/train_grok.cpp $(AUTOGRAD_DIR)/main.cpp
+	cp ../experiments/grok/train_grok.cpp $(AUTOGRAD_DIR)/main.cpp
 
 grok-train-build:
 	cd $(BUILD_DIR) && ninja example_autograd

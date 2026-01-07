@@ -133,29 +133,26 @@ struct Graph {
 };
 
 // Helper to create tensor on device
-inline Tensor make_zeros(ttnn::Shape shape, MeshDevice& device) {
-    return ttnn::zeros(shape, ttnn::DataType::BFLOAT16, ttnn::TILE_LAYOUT, device);
+inline Tensor make_zeros(
+    ttnn::Shape shape,
+    MeshDevice& device,
+    ttnn::DataType dtype = ttnn::DataType::BFLOAT16) {
+    return ttnn::zeros(shape, dtype, ttnn::TILE_LAYOUT, device);
 }
 
-inline Tensor make_full(ttnn::Shape shape, float value, MeshDevice& device) {
-    return ttnn::full(shape, value, ttnn::DataType::BFLOAT16, ttnn::TILE_LAYOUT, device);
+inline Tensor make_full(
+    ttnn::Shape shape,
+    float value,
+    MeshDevice& device,
+    ttnn::DataType dtype = ttnn::DataType::BFLOAT16) {
+    return ttnn::full(shape, value, dtype, ttnn::TILE_LAYOUT, device);
 }
 
-inline Tensor make_ones(ttnn::Shape shape, MeshDevice& device) {
-    return ttnn::ones(shape, ttnn::DataType::BFLOAT16, ttnn::TILE_LAYOUT, device);
-}
-
-// BFP8 tensor creation helpers
-inline Tensor make_zeros_bfp8(ttnn::Shape shape, MeshDevice& device) {
-    return ttnn::zeros(shape, ttnn::DataType::BFLOAT8_B, ttnn::TILE_LAYOUT, device);
-}
-
-inline Tensor make_full_bfp8(ttnn::Shape shape, float value, MeshDevice& device) {
-    return ttnn::full(shape, value, ttnn::DataType::BFLOAT8_B, ttnn::TILE_LAYOUT, device);
-}
-
-inline Tensor make_ones_bfp8(ttnn::Shape shape, MeshDevice& device) {
-    return ttnn::ones(shape, ttnn::DataType::BFLOAT8_B, ttnn::TILE_LAYOUT, device);
+inline Tensor make_ones(
+    ttnn::Shape shape,
+    MeshDevice& device,
+    ttnn::DataType dtype = ttnn::DataType::BFLOAT16) {
+    return ttnn::ones(shape, dtype, ttnn::TILE_LAYOUT, device);
 }
 
 }  // namespace static_autograd

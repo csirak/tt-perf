@@ -11,7 +11,7 @@
 //   make bench-gpt2-fwd-back-mxp
 //   BENCH_LAYERS=6 make bench-gpt2-fwd-back-mxp-run
 
-#include "static-mxp/nn.hpp"
+#include "autograd/nn.hpp"
 
 #include <ttnn/device.hpp>
 #include <tt-metalium/distributed.hpp>

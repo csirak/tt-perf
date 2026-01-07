@@ -1133,8 +1133,9 @@ bench-gpt2-fwd-back-mxp-profile: bench-gpt2-fwd-back-mxp-sync bench-gpt2-fwd-bac
 bench-gpt2-mxp-tgroup: bench-gpt2-mxp-tgroup-sync bench-gpt2-mxp-tgroup-build bench-gpt2-mxp-tgroup-run
 
 bench-gpt2-mxp-tgroup-sync:
-	mkdir -p $(AUTOGRAD_DIR)/static-mxp
-	cp -r static-mxp/* $(AUTOGRAD_DIR)/static-mxp/
+	mkdir -p $(AUTOGRAD_DIR)/autograd
+	cp -r nn $(AUTOGRAD_DIR)/autograd/
+	cp ops.hpp tensor_group.hpp value.hpp nn.hpp $(AUTOGRAD_DIR)/autograd/
 	cp common.hpp $(AUTOGRAD_DIR)/
 	cp ../bench/autograd/bench_gpt2_fwd_back_mxp_tgroup.cpp $(AUTOGRAD_DIR)/main.cpp
 
@@ -1300,8 +1301,9 @@ verify-attention-sdpa-run:
 bench-gpt2-mxp2: bench-gpt2-mxp2-sync bench-gpt2-mxp2-build bench-gpt2-mxp2-run
 
 bench-gpt2-mxp2-sync:
-	mkdir -p $(AUTOGRAD_DIR)/static-mxp
-	cp -r static-mxp/* $(AUTOGRAD_DIR)/static-mxp/
+	mkdir -p $(AUTOGRAD_DIR)/autograd
+	cp -r nn $(AUTOGRAD_DIR)/autograd/
+	cp ops.hpp tensor_group.hpp value.hpp nn.hpp $(AUTOGRAD_DIR)/autograd/
 	cp common.hpp $(AUTOGRAD_DIR)/
 	cp ../bench/autograd/bench_gpt2_mxp2.cpp $(AUTOGRAD_DIR)/main.cpp
 
@@ -1333,3 +1335,4 @@ bench-gpt2-mxp2-profile: bench-gpt2-mxp2-sync bench-gpt2-mxp2-build
 	@echo "=== Profiling Complete ==="
 	@echo "Tracy trace: $(PROFILER_LOGS)/gpt2_mxp2.tracy"
 	@echo "CSV output:  $(PROFILER_LOGS)/gpt2_mxp2.csv"
+

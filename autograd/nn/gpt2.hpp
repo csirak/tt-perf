@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common.hpp"
+#include "adam.hpp"
 
 #include <stdexcept>
 
@@ -241,9 +242,12 @@ struct PersistentGrokGPT2 {
 
     PersistentGrokGPT2(uint32_t b, uint32_t s, uint32_t d, uint32_t h, uint32_t ffn_mult,
                        uint32_t v, float learning_rate, MeshDevice& dev)
-        : tok(v, d, b, s, 0.02f, dev),
-          pos(s, d, b, s, 0.02f, dev),
-          output_proj(b, s, d, v, 0.02f, dev),
+        // PyTorch-like initialization:
+        // - Embedding: N(0, 1) → std=1.0
+        // - Linear: kaiming uniform → std ≈ sqrt(1/fan_in)
+        : tok(v, d, b, s, 1.0f, dev),  // N(0,1) for embedding
+          pos(s, d, b, s, 1.0f, dev),  // N(0,1) for embedding
+          output_proj(b, s, d, v, std::sqrt(1.0f / d), dev),  // kaiming for linear
           token_indices(make_indices(std::vector<uint32_t>(b * s, 0), ttnn::Shape({b, s}), dev)),
           pos_indices(make_indices(build_pos_indices(b, s), ttnn::Shape({b, s}), dev)),
           tok_plus_pos(make_zeros(ttnn::Shape({b, s, d}), dev)),
@@ -252,8 +256,9 @@ struct PersistentGrokGPT2 {
           lr(learning_rate),
           device(&dev) {
         layers.reserve(N);
+        float layer_init = std::sqrt(1.0f / d);  // kaiming for linear layers
         for (size_t i = 0; i < N; ++i) {
-            layers.emplace_back(b, s, d, h, ffn_mult, 0.02f, dev);
+            layers.emplace_back(b, s, d, h, ffn_mult, layer_init, dev);
         }
     }
 
@@ -306,13 +311,142 @@ struct PersistentGrokGPT2 {
         return &output_proj.out;
     }
 
-    void sgd_step(float lr_) {
-        tok.sgd_step(lr_);
-        pos.sgd_step(lr_);
+    void sgd_step(float lr_, float momentum = 0.0f, float weight_decay = 0.0f) {
+        tok.sgd_step(lr_, momentum, weight_decay);
+        pos.sgd_step(lr_, momentum, weight_decay);
         for (size_t i = 0; i < N; ++i) {
-            layers[i].sgd_step(lr_);
+            layers[i].sgd_step(lr_, momentum, weight_decay);
         }
-        output_proj.sgd_step(lr_);
+        output_proj.sgd_step(lr_, momentum, weight_decay);
+    }
+
+    // Register all parameters with Adam optimizer
+    void register_adam(Adam& adam) {
+        ADAM_REGISTER_EMBEDDING(adam, tok, *device);
+        ADAM_REGISTER_EMBEDDING(adam, pos, *device);
+        for (size_t i = 0; i < N; ++i) {
+            layers[i].register_adam(adam, *device);
+        }
+        ADAM_REGISTER_LINEAR3D(adam, output_proj, *device);
+    }
+};
+
+// =============================================================================
+// PersistentGrokGPT2LN: Grok GPT-2 with LayerNorm (for parity/debug)
+// =============================================================================
+template <size_t N>
+struct PersistentGrokGPT2LN {
+    static_assert(N >= 1, "Must have at least 1 layer");
+
+    Embedding tok;
+    Embedding pos;
+    std::vector<PersistentTransformerLayerLN> layers;
+    LayerNorm ln_final;  // Final LayerNorm before output projection
+    Linear3D output_proj;
+
+    Tensor token_indices;
+    Tensor pos_indices;
+    Tensor tok_plus_pos;
+    Tensor d_tok_plus_pos;
+
+    Graph graph;
+    Value* token_node = nullptr;
+    Value* pos_node = nullptr;
+    Value* logits_node = nullptr;
+    bool built = false;
+
+    uint32_t batch, seq, dim, vocab;
+    float lr;
+    float ln_eps;
+    MeshDevice* device;
+
+    PersistentGrokGPT2LN(uint32_t b, uint32_t s, uint32_t d, uint32_t h, uint32_t ffn_mult,
+                         uint32_t v, float learning_rate, float ln_eps_, MeshDevice& dev)
+        // PyTorch-like initialization:
+        // - Embedding: N(0, 1) → std=1.0
+        // - Linear: kaiming uniform → std ≈ sqrt(1/fan_in)
+        : tok(v, d, b, s, 1.0f, dev),  // N(0,1) for embedding
+          pos(s, d, b, s, 1.0f, dev),  // N(0,1) for embedding
+          ln_final(b, s, d, ln_eps_, dev),  // Final LN
+          output_proj(b, s, d, v, std::sqrt(1.0f / d), dev),  // kaiming for linear
+          token_indices(make_indices(std::vector<uint32_t>(b * s, 0), ttnn::Shape({b, s}), dev)),
+          pos_indices(make_indices(PersistentGrokGPT2<N>::build_pos_indices(b, s), ttnn::Shape({b, s}), dev)),
+          tok_plus_pos(make_zeros(ttnn::Shape({b, s, d}), dev)),
+          d_tok_plus_pos(make_zeros(ttnn::Shape({b, s, d}), dev)),
+          batch(b), seq(s), dim(d), vocab(v),
+          lr(learning_rate),
+          ln_eps(ln_eps_),
+          device(&dev) {
+        layers.reserve(N);
+        float layer_init = std::sqrt(1.0f / d);  // kaiming for linear layers
+        for (size_t i = 0; i < N; ++i) {
+            layers.emplace_back(b, s, d, h, ffn_mult, layer_init, dev, ln_eps);
+        }
+    }
+
+    void set_tokens(const std::vector<uint32_t>& tokens) {
+        if (tokens.size() != static_cast<size_t>(batch) * seq) {
+            throw std::runtime_error("token buffer size mismatch");
+        }
+        token_indices = make_indices(tokens, ttnn::Shape({batch, seq}), *device);
+    }
+
+    void build_graph() {
+        token_node = graph.leaf(&token_indices, nullptr, false);
+        pos_node = graph.leaf(&pos_indices, nullptr, false);
+
+        auto* tok_v = tok.forward(graph, token_node);
+        auto* pos_v = pos.forward(graph, pos_node);
+        auto* h = add(graph, tok_v, pos_v, &tok_plus_pos, &d_tok_plus_pos);
+
+        for (size_t i = 0; i < N; ++i) {
+            h = layers[i].forward(graph, h);
+        }
+
+        // Final LayerNorm before output projection
+        h = ln_final.forward(graph, h);
+
+        logits_node = output_proj.forward(graph, h);
+        built = true;
+    }
+
+    Tensor* execute_forward() {
+        auto* tok_out = tok.execute_forward(token_indices);
+        auto* pos_out = pos.execute_forward(pos_indices);
+        tok_plus_pos = ttnn::add(*tok_out, *pos_out);
+
+        Tensor* h = &tok_plus_pos;
+        for (size_t i = 0; i < N; ++i) {
+            h = layers[i].execute_forward(*h);
+        }
+
+        // Final LayerNorm before output projection
+        h = ln_final.execute_forward(*h);
+
+        output_proj.out = ttnn::add(ttnn::matmul(*h, output_proj.weight, false, true),
+                                    output_proj.bias);
+        return &output_proj.out;
+    }
+
+    void sgd_step(float lr_, float momentum = 0.0f, float weight_decay = 0.0f) {
+        tok.sgd_step(lr_, momentum, weight_decay);
+        pos.sgd_step(lr_, momentum, weight_decay);
+        for (size_t i = 0; i < N; ++i) {
+            layers[i].sgd_step(lr_, momentum, weight_decay);
+        }
+        ln_final.sgd_step(lr_, momentum, weight_decay);
+        output_proj.sgd_step(lr_, momentum, weight_decay);
+    }
+
+    // Register all parameters with Adam optimizer
+    void register_adam(Adam& adam) {
+        ADAM_REGISTER_EMBEDDING(adam, tok, *device);
+        ADAM_REGISTER_EMBEDDING(adam, pos, *device);
+        for (size_t i = 0; i < N; ++i) {
+            layers[i].register_adam(adam, *device);
+        }
+        ADAM_REGISTER_LAYERNORM(adam, ln_final, *device);
+        ADAM_REGISTER_LINEAR3D(adam, output_proj, *device);
     }
 };
 

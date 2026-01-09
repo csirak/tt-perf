@@ -105,6 +105,11 @@ struct Graph {
     // Backward pass using cached topological order
     // If topo_order is empty, builds it first (for compatibility)
     void backward(Value* r) {
+        backward_scaled(r, 1.0f);
+    }
+
+    // Backward pass with explicit root gradient scale
+    void backward_scaled(Value* r, float root_scale) {
 #ifdef TRACY_ENABLE
         ZoneScopedN("graph_backward");
 #endif
@@ -112,9 +117,9 @@ struct Graph {
             build_topo(r);
         }
 
-        // Initialize root gradient to ones each call (dL/dL = 1)
+        // Initialize root gradient to scaled ones each call (dL/dL = scale)
         if (root && root->grad) {
-            *root->grad = ttnn::ones_like(*root->data);
+            *root->grad = ttnn::multiply(ttnn::ones_like(*root->data), root_scale);
         }
 
         // Mark root grad as initialized so it doesn't get overwritten

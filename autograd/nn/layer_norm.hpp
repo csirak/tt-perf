@@ -1,6 +1,9 @@
 #pragma once
 
 #include "common.hpp"
+#include <ttnn/operations/normalization/layernorm/layernorm.hpp>
+#include <ttnn/operations/moreh/moreh_layer_norm/moreh_layer_norm.hpp>
+#include <ttnn/operations/moreh/moreh_layer_norm_backward/moreh_layer_norm_backward.hpp>
 
 namespace static_autograd {
 
@@ -11,11 +14,17 @@ struct LayerNorm {
     Tensor d_gamma;
     Tensor d_beta;
 
+    // Velocity buffers for momentum
+    Tensor v_gamma;
+    Tensor v_beta;
+
     // Forward buffers
     Tensor out;
     Tensor d_out;
-    Tensor x_norm;      // cached normalized input for backward
+    Tensor x_norm;      // unused (kept for compatibility)
+    Tensor mean;        // cached mean for backward
     Tensor rstd;        // cached 1/sqrt(var+eps) for backward
+    Tensor d_input;     // temp buffer for input grad
 
     uint32_t dim;
     float eps;
@@ -25,10 +34,14 @@ struct LayerNorm {
           beta(make_zeros(ttnn::Shape({1, 1, d}), dev)),
           d_gamma(make_zeros(ttnn::Shape({1, 1, d}), dev)),
           d_beta(make_zeros(ttnn::Shape({1, 1, d}), dev)),
+          v_gamma(make_zeros(ttnn::Shape({1, 1, d}), dev)),
+          v_beta(make_zeros(ttnn::Shape({1, 1, d}), dev)),
           out(make_zeros(ttnn::Shape({batch, seq, d}), dev)),
           d_out(make_zeros(ttnn::Shape({batch, seq, d}), dev)),
           x_norm(make_zeros(ttnn::Shape({batch, seq, d}), dev)),
+          mean(make_zeros(ttnn::Shape({batch, seq, 1}), dev)),
           rstd(make_zeros(ttnn::Shape({batch, seq, 1}), dev)),
+          d_input(make_zeros(ttnn::Shape({batch, seq, d}), dev)),
           dim(d),
           eps(epsilon) {}
 
@@ -39,18 +52,25 @@ struct LayerNorm {
         auto* gam = g.leaf(&gamma, &d_gamma, true);
         auto* bet = g.leaf(&beta, &d_beta, true);
 
-        // mean = mean(x, dim=-1, keepdim=True)
-        auto mean_val = ttnn::mean(*x->data, -1, true);
-        // x_centered = x - mean
-        auto x_centered = ttnn::subtract(*x->data, mean_val);
-        // var = mean(x_centered^2)
-        auto var = ttnn::mean(ttnn::multiply(x_centered, x_centered), -1, true);
-        // rstd = 1/sqrt(var + eps)
-        rstd = ttnn::rsqrt(ttnn::add(var, eps), true);
-        // x_norm = x_centered * rstd
-        x_norm = ttnn::multiply(x_centered, rstd);
-        // out = gamma * x_norm + beta
-        out = ttnn::add(ttnn::multiply(gamma, x_norm), beta);
+        auto compute_cfg = get_fp32_acc_compute_config();
+        out = ttnn::layer_norm(*x->data, eps, gamma, beta,
+                               std::nullopt, std::nullopt, std::nullopt,
+                               compute_cfg);
+
+        // Recompute mean/rstd for backward using moreh (for now)
+        auto stats = ttnn::moreh_layer_norm(
+            *x->data,
+            /* normalized_dims */ 1,
+            eps,
+            gamma,
+            beta,
+            x_norm,
+            mean,
+            rstd,
+            std::nullopt,
+            compute_cfg);
+        mean = stats[1].value();
+        rstd = stats[2].value();
 
         auto* v = g.node(&out, &d_out);
         v->parents = {x, gam, bet};
@@ -59,38 +79,65 @@ struct LayerNorm {
             if (!v->grad) return;
             const auto& dout = *v->grad;
 
-            // d_beta = sum(dout, dims=[0,1])
-            if (bet->requires_grad) {
-                auto sum0 = ttnn::sum(dout, 0, true);
-                bet->accumulate_grad(ttnn::sum(sum0, 1, true));
-            }
+            auto res = ttnn::moreh_layer_norm_backward(
+                dout,
+                *x->data,
+                mean,
+                rstd,
+                /* normalized_dims */ 1,
+                gamma,
+                d_input,
+                d_gamma,
+                d_beta,
+                std::nullopt,
+                get_fp32_acc_compute_config());
 
-            // d_gamma = sum(dout * x_norm, dims=[0,1])
-            if (gam->requires_grad) {
-                auto d_out_x_norm = ttnn::multiply(dout, x_norm);
-                auto sum0_g = ttnn::sum(d_out_x_norm, 0, true);
-                gam->accumulate_grad(ttnn::sum(sum0_g, 1, true));
-            }
-
-            // d_x = rstd * (d_x_norm - mean(d_x_norm) - x_norm * mean(d_x_norm * x_norm))
             if (x->requires_grad) {
-                auto d_x_norm = ttnn::multiply(dout, gamma);
-                auto mean_d_x_norm = ttnn::mean(d_x_norm, -1, true);
-                auto d_x_norm_x_norm = ttnn::multiply(d_x_norm, x_norm);
-                auto mean_d_x_norm_x_norm = ttnn::mean(d_x_norm_x_norm, -1, true);
-                auto diff1 = ttnn::subtract(d_x_norm, mean_d_x_norm);
-                auto term2 = ttnn::multiply(x_norm, mean_d_x_norm_x_norm);
-                auto diff2 = ttnn::subtract(diff1, term2);
-                x->accumulate_grad(ttnn::multiply(rstd, diff2));
+                x->accumulate_grad(res[0].value());
+            }
+            if (gam->requires_grad) {
+                gam->accumulate_grad(res[1].value());
+            }
+            if (bet->requires_grad) {
+                bet->accumulate_grad(res[2].value());
             }
         };
 
         return v;
     }
 
-    void sgd_step(float lr) {
-        gamma = ttnn::subtract(gamma, ttnn::multiply(d_gamma, lr));
-        beta = ttnn::subtract(beta, ttnn::multiply(d_beta, lr));
+    Tensor* execute_forward(const Tensor& x) {
+        auto compute_cfg = get_fp32_acc_compute_config();
+        out = ttnn::layer_norm(x, eps, gamma, beta,
+                               std::nullopt, std::nullopt, std::nullopt,
+                               compute_cfg);
+        auto stats = ttnn::moreh_layer_norm(
+            x,
+            /* normalized_dims */ 1,
+            eps,
+            gamma,
+            beta,
+            x_norm,
+            mean,
+            rstd,
+            std::nullopt,
+            compute_cfg);
+        mean = stats[1].value();
+        rstd = stats[2].value();
+        return &out;
+    }
+
+    void sgd_step(float lr, float momentum = 0.0f, float weight_decay = 0.0f) {
+        if (momentum > 0.0f) {
+            // v = momentum * v + grad (no wd on LN params)
+            v_gamma = ttnn::add(ttnn::multiply(v_gamma, momentum), d_gamma);
+            v_beta = ttnn::add(ttnn::multiply(v_beta, momentum), d_beta);
+            gamma = ttnn::subtract(gamma, ttnn::multiply(v_gamma, lr));
+            beta = ttnn::subtract(beta, ttnn::multiply(v_beta, lr));
+        } else {
+            gamma = ttnn::subtract(gamma, ttnn::multiply(d_gamma, lr));
+            beta = ttnn::subtract(beta, ttnn::multiply(d_beta, lr));
+        }
     }
 };
 
@@ -108,6 +155,10 @@ struct LayerNormBFP8 {
     Tensor d_gamma;
     Tensor d_beta;
 
+    // Velocity buffers for momentum
+    Tensor v_gamma;
+    Tensor v_beta;
+
     // Forward buffers
     Tensor out;         // BFP8 output
     Tensor d_out;       // BF16 gradient
@@ -122,6 +173,8 @@ struct LayerNormBFP8 {
           beta(make_zeros(ttnn::Shape({1, 1, d}), dev)),
           d_gamma(make_zeros(ttnn::Shape({1, 1, d}), dev)),
           d_beta(make_zeros(ttnn::Shape({1, 1, d}), dev)),
+          v_gamma(make_zeros(ttnn::Shape({1, 1, d}), dev)),
+          v_beta(make_zeros(ttnn::Shape({1, 1, d}), dev)),
           out(make_zeros(ttnn::Shape({batch, seq, d}), dev, ttnn::DataType::BFLOAT8_B)),  // BFP8 output
           d_out(make_zeros(ttnn::Shape({batch, seq, d}), dev)),
           x_norm(make_zeros(ttnn::Shape({batch, seq, d}), dev)),
@@ -138,13 +191,14 @@ struct LayerNormBFP8 {
 
         // All intermediate computations in BF16 for numerical stability
         // mean = mean(x, dim=-1, keepdim=True)
-        auto mean_val = ttnn::mean(*x->data, -1, true);
+        auto mean_val = ttnn::mean(*x->data, -1, true, std::nullopt, get_fp32_acc_compute_config());
         // x_centered = x - mean
         auto x_centered = ttnn::subtract(*x->data, mean_val);
         // var = mean(x_centered^2)
-        auto var = ttnn::mean(ttnn::multiply(x_centered, x_centered), -1, true);
+        auto var = ttnn::mean(ttnn::multiply(x_centered, x_centered), -1, true, std::nullopt,
+                              get_fp32_acc_compute_config());
         // rstd = 1/sqrt(var + eps)
-        rstd = ttnn::rsqrt(ttnn::add(var, eps), true);
+        rstd = ttnn::rsqrt(ttnn::add(var, eps), false);
         // x_norm = x_centered * rstd
         x_norm = ttnn::multiply(x_centered, rstd);
         // scaled = gamma * x_norm
@@ -196,9 +250,11 @@ struct LayerNormBFP8 {
                 ZoneScopedN("ln_d_x");
 #endif
                 auto d_x_norm = ttnn::multiply(dout, gamma);
-                auto mean_d_x_norm = ttnn::mean(d_x_norm, -1, true);
+                auto mean_d_x_norm = ttnn::mean(d_x_norm, -1, true, std::nullopt,
+                                                 get_fp32_acc_compute_config());
                 auto d_x_norm_x_norm = ttnn::multiply(d_x_norm, x_norm);
-                auto mean_d_x_norm_x_norm = ttnn::mean(d_x_norm_x_norm, -1, true);
+                auto mean_d_x_norm_x_norm = ttnn::mean(d_x_norm_x_norm, -1, true, std::nullopt,
+                                                       get_fp32_acc_compute_config());
                 auto diff1 = ttnn::subtract(d_x_norm, mean_d_x_norm);
                 auto term2 = ttnn::multiply(x_norm, mean_d_x_norm_x_norm);
                 auto diff2 = ttnn::subtract(diff1, term2);
@@ -209,9 +265,16 @@ struct LayerNormBFP8 {
         return v;
     }
 
-    void sgd_step(float lr) {
-        gamma = ttnn::subtract(gamma, ttnn::multiply(d_gamma, lr));
-        beta = ttnn::subtract(beta, ttnn::multiply(d_beta, lr));
+    void sgd_step(float lr, float momentum = 0.0f, float weight_decay = 0.0f) {
+        if (momentum > 0.0f) {
+            v_gamma = ttnn::add(ttnn::multiply(v_gamma, momentum), d_gamma);
+            v_beta = ttnn::add(ttnn::multiply(v_beta, momentum), d_beta);
+            gamma = ttnn::subtract(gamma, ttnn::multiply(v_gamma, lr));
+            beta = ttnn::subtract(beta, ttnn::multiply(v_beta, lr));
+        } else {
+            gamma = ttnn::subtract(gamma, ttnn::multiply(d_gamma, lr));
+            beta = ttnn::subtract(beta, ttnn::multiply(d_beta, lr));
+        }
     }
 };
 

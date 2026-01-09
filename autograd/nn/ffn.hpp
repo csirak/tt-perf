@@ -27,9 +27,9 @@ struct FFN {
         return w2.forward(g, h);
     }
 
-    void sgd_step(float lr) {
-        w1.sgd_step(lr);
-        w2.sgd_step(lr);
+    void sgd_step(float lr, float momentum = 0.0f, float weight_decay = 0.0f) {
+        w1.sgd_step(lr, momentum, weight_decay);
+        w2.sgd_step(lr, momentum, weight_decay);
     }
 };
 
@@ -65,8 +65,8 @@ struct FFNBFP8 {
         return w2.forward(g, h);
     }
 
-    void sgd_step(float lr) {
-        w1.sgd_step(lr);
+    void sgd_step(float lr, float momentum = 0.0f, float weight_decay = 0.0f) {
+        w1.sgd_step(lr);  // Linear3DBFP8 doesn't use momentum/wd yet
         w2.sgd_step(lr);
     }
 };
@@ -103,13 +103,13 @@ struct FFNBFP8MXP {
         return w2.forward(g, h);
     }
 
-    void sgd_step(float lr) {
-        w1.sgd_step(lr);
+    void sgd_step(float lr, float momentum = 0.0f, float weight_decay = 0.0f) {
+        w1.sgd_step(lr);  // LinearBFP8MXP doesn't use momentum/wd yet
         w2.sgd_step(lr);
     }
 
     // SGD step that only updates BF16 master weights (no typecast)
-    void sgd_step_bf16_only(float lr) {
+    void sgd_step_bf16_only(float lr, float momentum = 0.0f, float weight_decay = 0.0f) {
         w1.sgd_step_bf16_only(lr);
         w2.sgd_step_bf16_only(lr);
     }

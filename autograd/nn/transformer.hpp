@@ -73,18 +73,16 @@ struct TransformerLayerMXP {
         auto* v_v = wv.forward(g, ln1_v);
 
         // Simplified attention: scores = Q @ K.T * scale
-        attn_scores = ttnn::multiply(ttnn::matmul(*q_v->data, *k_v->data, false, true), scale);
+        attn_scores = ttnn::multiply(matmul_fp32_acc(*q_v->data, *k_v->data, false, true), scale);
 
         // Apply causal mask
         auto scores_masked = ttnn::add(attn_scores, causal_mask);
 
         // Softmax
-        auto x_max = ttnn::max(scores_masked, -1, true);
-        auto x_centered = ttnn::subtract(scores_masked, x_max);
-        attn_weights = ttnn::softmax(x_centered, -1);
+        attn_weights = ttnn::softmax(scores_masked, -1, std::nullopt, get_softmax_compute_config(), true);
 
         // attn_out = attn_weights @ V
-        attn_out = ttnn::matmul(attn_weights, *v_v->data);
+        attn_out = matmul_fp32_acc(attn_weights, *v_v->data);
 
         // Create node for attention output
         auto* attn_v = g.node(&attn_out, &d_attn_out);
@@ -95,9 +93,9 @@ struct TransformerLayerMXP {
             if (!attn_v->grad) return;
             const auto& dout = *attn_v->grad;
 
-            auto d_attn = ttnn::matmul(dout, *v_v->data, false, true);
+            auto d_attn = matmul_fp32_acc(dout, *v_v->data, false, true);
             if (v_v->requires_grad) {
-                v_v->accumulate_grad(ttnn::matmul(attn_weights, dout, true, false));
+                v_v->accumulate_grad(matmul_fp32_acc(attn_weights, dout, true, false));
             }
 
             auto dy_y = ttnn::multiply(d_attn, attn_weights);
@@ -106,10 +104,10 @@ struct TransformerLayerMXP {
             auto d_scores_scaled = ttnn::multiply(d_scores, scale);
 
             if (q_v->requires_grad) {
-                q_v->accumulate_grad(ttnn::matmul(d_scores_scaled, *k_v->data));
+                q_v->accumulate_grad(matmul_fp32_acc(d_scores_scaled, *k_v->data));
             }
             if (k_v->requires_grad) {
-                k_v->accumulate_grad(ttnn::matmul(d_scores_scaled, *q_v->data, true, false));
+                k_v->accumulate_grad(matmul_fp32_acc(d_scores_scaled, *q_v->data, true, false));
             }
         };
 
@@ -145,14 +143,12 @@ struct TransformerLayerMXP {
         wv.out = ttnn::add(ttnn::matmul(ln1.out, wv.weight, false, true), wv.bias);
 
         // Attention scores + mask + softmax
-        attn_scores = ttnn::multiply(ttnn::matmul(wq.out, wk.out, false, true), scale);
+        attn_scores = ttnn::multiply(matmul_fp32_acc(wq.out, wk.out, false, true), scale);
         auto scores_masked = ttnn::add(attn_scores, causal_mask);
-        auto scores_max = ttnn::max(scores_masked, -1, true);
-        auto scores_centered = ttnn::subtract(scores_masked, scores_max);
-        attn_weights = ttnn::softmax(scores_centered, -1);
+        attn_weights = ttnn::softmax(scores_masked, -1, std::nullopt, get_softmax_compute_config(), true);
 
         // Attention output
-        attn_out = ttnn::matmul(attn_weights, wv.out);
+        attn_out = matmul_fp32_acc(attn_weights, wv.out);
 
         // Output projection
         wo.out = ttnn::add(ttnn::matmul(attn_out, wo.weight, false, true), wo.bias);
@@ -177,7 +173,7 @@ struct TransformerLayerMXP {
                                   /*program_config=*/std::nullopt,
                                   /*activation=*/std::nullopt,
                                   /*compute_kernel_config=*/LinearBFP8MXP::get_compute_config());
-        ffn.gelu_out = ttnn::gelu(ffn.w1.out, true);
+        ffn.gelu_out = gelu_forward_tensor(ffn.w1.out);
         ffn.w2.out = ttnn::linear(ffn.gelu_out, ffn.w2.weight, ffn.w2.bias,
                                   /*transpose_a=*/false, /*transpose_b=*/true,
                                   /*memory_config=*/std::nullopt,

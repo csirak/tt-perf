@@ -1358,3 +1358,165 @@ grok-train-build:
 grok-train-run:
 	cd $(TT_METAL) && ./build_Release/ttnn/examples/example_autograd
 
+# === Linear Verify (BF16) ===
+# Usage: LINEAR_VERIFY_CONFIG=~/ttnn-perf/experiments/linear_verify/default.yaml make linear-verify
+
+linear-verify: linear-verify-sync linear-verify-build linear-verify-run
+
+linear-verify-sync:
+	mkdir -p $(AUTOGRAD_DIR)/autograd
+	mkdir -p $(AUTOGRAD_DIR)/utils
+	cp -r nn $(AUTOGRAD_DIR)/autograd/
+	cp -r utils $(AUTOGRAD_DIR)/autograd/
+	cp ops.hpp tensor_group.hpp value.hpp nn.hpp $(AUTOGRAD_DIR)/autograd/
+	cp common.hpp $(AUTOGRAD_DIR)/
+	cp ../experiments/linear_verify/linear_verify.cpp $(AUTOGRAD_DIR)/main.cpp
+
+linear-verify-build:
+	cd $(BUILD_DIR) && ninja example_autograd
+
+linear-verify-run:
+	cd $(TT_METAL) && ./build_Release/ttnn/examples/example_autograd
+
+# === MNIST MLP Parity (AdamW) ===
+# Usage: MNIST_CONFIG=~/ttnn-perf/experiments/mnist/default.yaml make mnist-train
+
+mnist-train: mnist-train-sync mnist-train-build mnist-train-run
+
+mnist-train-sync:
+	mkdir -p $(AUTOGRAD_DIR)/autograd
+	mkdir -p $(AUTOGRAD_DIR)/utils
+	cp -r nn $(AUTOGRAD_DIR)/autograd/
+	cp -r utils $(AUTOGRAD_DIR)/autograd/
+	cp ops.hpp tensor_group.hpp value.hpp nn.hpp $(AUTOGRAD_DIR)/autograd/
+	cp common.hpp $(AUTOGRAD_DIR)/
+	cp ../experiments/mnist/train_mnist.cpp $(AUTOGRAD_DIR)/main.cpp
+
+mnist-train-build:
+	cd $(BUILD_DIR) && ninja example_autograd
+
+mnist-train-run:
+	cd $(TT_METAL) && ./build_Release/ttnn/examples/example_autograd
+
+# === GPT2 Reimplementation Parity (single layer, op-by-op) ===
+# Usage: GPT2_REIMPL_CONFIG=~/ttnn-perf/experiments/gpt2_reimpl/default.yaml make gpt2-reimpl
+
+gpt2-reimpl: gpt2-reimpl-sync gpt2-reimpl-build gpt2-reimpl-run
+
+gpt2-reimpl-sync:
+	mkdir -p $(AUTOGRAD_DIR)/autograd
+	mkdir -p $(AUTOGRAD_DIR)/utils
+	cp -r nn $(AUTOGRAD_DIR)/autograd/
+	cp -r utils $(AUTOGRAD_DIR)/autograd/
+	cp ops.hpp tensor_group.hpp value.hpp nn.hpp $(AUTOGRAD_DIR)/autograd/
+	cp common.hpp $(AUTOGRAD_DIR)/
+	cp ../experiments/gpt2_reimpl/gpt2_reimpl.cpp $(AUTOGRAD_DIR)/main.cpp
+
+gpt2-reimpl-build:
+	cd $(BUILD_DIR) && ninja example_autograd
+
+gpt2-reimpl-run:
+	cd $(TT_METAL) && ./build_Release/ttnn/examples/example_autograd
+
+# === GPT2 Rebuild Parity (incremental stages) ===
+# Usage: GPT2_REBUILD_CONFIG=~/ttnn-perf/experiments/gpt2_rebuild/default.yaml make gpt2-rebuild
+
+gpt2-rebuild: gpt2-rebuild-sync gpt2-rebuild-build gpt2-rebuild-run
+
+gpt2-rebuild-sync:
+	mkdir -p $(AUTOGRAD_DIR)/autograd
+	mkdir -p $(AUTOGRAD_DIR)/utils
+	cp -r nn $(AUTOGRAD_DIR)/autograd/
+	cp -r utils $(AUTOGRAD_DIR)/autograd/
+	cp ops.hpp tensor_group.hpp value.hpp nn.hpp $(AUTOGRAD_DIR)/autograd/
+	cp common.hpp $(AUTOGRAD_DIR)/
+	cp ../experiments/gpt2_rebuild/gpt2_rebuild.cpp $(AUTOGRAD_DIR)/main.cpp
+
+gpt2-rebuild-build:
+	cd $(BUILD_DIR) && ninja example_autograd
+
+gpt2-rebuild-run:
+	cd $(TT_METAL) && ./build_Release/ttnn/examples/example_autograd
+
+# === Train Folder: GPT2 Rebuild (incremental stages) ===
+# Usage: TRAIN_GPT2_CONFIG=~/ttnn-perf/train/gpt2/default.yaml make train-gpt2
+
+train-gpt2: train-gpt2-sync train-gpt2-build train-gpt2-run
+
+train-gpt2-sync:
+	mkdir -p $(AUTOGRAD_DIR)/autograd
+	mkdir -p $(AUTOGRAD_DIR)/utils
+	cp -r nn $(AUTOGRAD_DIR)/autograd/
+	cp -r utils $(AUTOGRAD_DIR)/autograd/
+	cp ops.hpp tensor_group.hpp value.hpp nn.hpp $(AUTOGRAD_DIR)/autograd/
+	cp common.hpp $(AUTOGRAD_DIR)/
+	cp ../train/gpt2/train_gpt2.cpp $(AUTOGRAD_DIR)/main.cpp
+
+train-gpt2-build:
+	cd $(BUILD_DIR) && ninja example_autograd
+
+train-gpt2-run:
+	cd $(TT_METAL) && ./build_Release/ttnn/examples/example_autograd
+
+# === Train Folder: MNIST MLP ===
+# Usage: TRAIN_MNIST_CONFIG=~/ttnn-perf/train/mnist/default.yaml make train-mnist
+
+train-mnist: train-mnist-sync train-mnist-build train-mnist-run
+
+train-mnist-sync:
+	mkdir -p $(AUTOGRAD_DIR)/autograd
+	mkdir -p $(AUTOGRAD_DIR)/utils
+	cp -r nn $(AUTOGRAD_DIR)/autograd/
+	cp -r utils $(AUTOGRAD_DIR)/autograd/
+	cp ops.hpp tensor_group.hpp value.hpp nn.hpp $(AUTOGRAD_DIR)/autograd/
+	cp common.hpp $(AUTOGRAD_DIR)/
+	cp ../train/mnist/train_mnist.cpp $(AUTOGRAD_DIR)/main.cpp
+
+train-mnist-build:
+	cd $(BUILD_DIR) && ninja example_autograd
+
+train-mnist-run:
+	cd $(TT_METAL) && ./build_Release/ttnn/examples/example_autograd
+
+# === Test: ROW_MAJOR subtract behavior ===
+# Checks if ttnn::subtract corrupts ROW_MAJOR tensors
+test-row-major: test-row-major-sync test-row-major-build test-row-major-run
+
+test-row-major-sync:
+	mkdir -p $(AUTOGRAD_DIR)
+	cp common.hpp $(AUTOGRAD_DIR)/
+	cp tests/test_row_major_subtract.cpp $(AUTOGRAD_DIR)/main.cpp
+
+test-row-major-build:
+	cd $(BUILD_DIR) && ninja example_autograd
+
+test-row-major-run:
+	cd $(TT_METAL) && ./build_Release/ttnn/examples/example_autograd
+
+# === Test: ROW_MAJOR multiply then subtract ===
+test-rm-mul-sub: test-rm-mul-sub-sync test-rm-mul-sub-build test-rm-mul-sub-run
+
+test-rm-mul-sub-sync:
+	mkdir -p $(AUTOGRAD_DIR)
+	cp common.hpp $(AUTOGRAD_DIR)/
+	cp tests/test_row_major_multiply_subtract.cpp $(AUTOGRAD_DIR)/main.cpp
+
+test-rm-mul-sub-build:
+	cd $(BUILD_DIR) && ninja example_autograd
+
+test-rm-mul-sub-run:
+	cd $(TT_METAL) && ./build_Release/ttnn/examples/example_autograd
+
+# === Test: TILE_LAYOUT subtract behavior ===
+test-tile-sub: test-tile-sub-sync test-tile-sub-build test-tile-sub-run
+
+test-tile-sub-sync:
+	mkdir -p $(AUTOGRAD_DIR)
+	cp common.hpp $(AUTOGRAD_DIR)/
+	cp tests/test_tile_subtract.cpp $(AUTOGRAD_DIR)/main.cpp
+
+test-tile-sub-build:
+	cd $(BUILD_DIR) && ninja example_autograd
+
+test-tile-sub-run:
+	cd $(TT_METAL) && ./build_Release/ttnn/examples/example_autograd

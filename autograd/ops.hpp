@@ -14,8 +14,33 @@
 #include <ttnn/operations/eltwise/unary_backward/unary_backward.hpp>
 #include <ttnn/operations/normalization/softmax/softmax.hpp>
 #include <ttnn/operations/reduction/generic/generic_reductions.hpp>
+#include <ttnn/operations/core/compute_kernel/compute_kernel_config.hpp>
+#include <cstdlib>
+#include <string_view>
 
 namespace static_autograd {
+
+inline ttnn::WormholeComputeKernelConfig get_softmax_compute_config() {
+    return ttnn::WormholeComputeKernelConfig{
+        .math_fidelity = MathFidelity::HiFi2,
+        .math_approx_mode = false,
+        .fp32_dest_acc_en = true,
+        .packer_l1_acc = true,
+    };
+}
+
+inline const char* gelu_approx_mode() {
+    const char* env = std::getenv("GELU_APPROX");
+    return (env && *env) ? env : "none";
+}
+
+inline bool gelu_fast_mode() {
+    return std::string_view(gelu_approx_mode()) == "tanh";
+}
+
+inline Tensor gelu_forward_tensor(const Tensor& x) {
+    return ttnn::gelu(x, gelu_fast_mode());
+}
 
 // Matmul: out = a @ b
 // Backward: da += dout @ b.T, db += a.T @ dout
@@ -158,7 +183,7 @@ inline Value* relu(Graph& g, Value* x, Tensor* out, Tensor* d_out, Tensor* mask)
 // GELU: out = gelu(x)
 // Backward: uses ttnn::gelu_bw
 inline Value* gelu(Graph& g, Value* x, Tensor* out, Tensor* d_out) {
-    *out = ttnn::gelu(*x->data, true);  // fast_and_approximate=true
+    *out = gelu_forward_tensor(*x->data);
 
     auto* v = g.node(out, d_out);
     v->parents = {x};
@@ -171,7 +196,7 @@ inline Value* gelu(Graph& g, Value* x, Tensor* out, Tensor* d_out) {
     v->backward_fn = [x, v]() {
         if (!v->grad) return;
         if (x->requires_grad) {
-            auto grads = ttnn::gelu_bw(*v->grad, *x->data, "none");
+            auto grads = ttnn::gelu_bw(*v->grad, *x->data, gelu_approx_mode());
             x->accumulate_grad(grads[0].value());
         }
     };
@@ -181,10 +206,7 @@ inline Value* gelu(Graph& g, Value* x, Tensor* out, Tensor* d_out) {
 // Softmax: out = softmax(x, dim)
 // Backward: dx += out * (dout - sum(dout * out, dim, keepdim))
 inline Value* softmax(Graph& g, Value* x, int dim, Tensor* out, Tensor* d_out) {
-    // Max-center for numerical stability
-    auto x_max = ttnn::max(*x->data, dim, true);
-    auto x_centered = ttnn::subtract(*x->data, x_max);
-    *out = ttnn::softmax(x_centered, dim);
+    *out = ttnn::softmax(*x->data, dim, std::nullopt, get_softmax_compute_config(), true);
 
     auto* v = g.node(out, d_out);
     v->parents = {x};

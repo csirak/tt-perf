@@ -6,6 +6,7 @@
 #include "nn/linear.hpp"
 #include "nn/mlp.hpp"
 #include "nn/layer_norm.hpp"
+#include "nn/dyt.hpp"
 #include "nn/ffn.hpp"
 #include "nn/attention.hpp"
 #include "nn/transformer.hpp"

@@ -29,8 +29,12 @@ struct Linear {
     uint32_t out_features;
     uint32_t batch_size;
 
+    static bool use_fp32_acc() {
+        return std::getenv("LINEAR_FP32_ACC") != nullptr;
+    }
+
     Linear(uint32_t batch, uint32_t in_f, uint32_t out_f, float init, MeshDevice& dev,
-           InitKind init_kind = InitKind::Constant)
+           InitKind init_kind = InitKind::Randn)
         : weight(make_init_tensor(ttnn::Shape({out_f, in_f}), init, dev, init_kind)),
           bias(make_zeros(ttnn::Shape({1, out_f}), dev)),
           d_weight(make_zeros(ttnn::Shape({out_f, in_f}), dev)),
@@ -60,7 +64,9 @@ struct Linear {
 
         // y = x @ weight.T + bias
         // Using matmul with transpose_b flag
-        mm_out = ttnn::matmul(*x->data, weight, false, true);
+        mm_out = use_fp32_acc()
+            ? matmul_fp32_acc(*x->data, weight, false, true)
+            : ttnn::matmul(*x->data, weight, false, true);
 
         auto* mm_v = g.node(&mm_out, &d_mm_out);
         mm_v->parents = {x, w};
@@ -71,11 +77,15 @@ struct Linear {
 
             // dx = dout @ weight (no transpose - weight is [out, in])
             if (x->requires_grad) {
-                x->accumulate_grad(ttnn::matmul(dout, weight));
+                x->accumulate_grad(use_fp32_acc()
+                    ? matmul_fp32_acc(dout, weight, false, false)
+                    : ttnn::matmul(dout, weight));
             }
             // dweight = dout.T @ x
             if (w->requires_grad) {
-                w->accumulate_grad(ttnn::matmul(dout, *x->data, true, false));
+                w->accumulate_grad(use_fp32_acc()
+                    ? matmul_fp32_acc(dout, *x->data, true, false)
+                    : ttnn::matmul(dout, *x->data, true, false));
             }
         };
 
@@ -123,7 +133,7 @@ struct LinearReLU {
     uint32_t batch_size;
 
     LinearReLU(uint32_t batch, uint32_t in_f, uint32_t out_f, float init, MeshDevice& dev,
-               InitKind init_kind = InitKind::Constant)
+               InitKind init_kind = InitKind::Randn)
         : weight(make_init_tensor(ttnn::Shape({out_f, in_f}), init, dev, init_kind)),
           bias(make_zeros(ttnn::Shape({1, out_f}), dev)),
           d_weight(make_zeros(ttnn::Shape({out_f, in_f}), dev)),
@@ -193,18 +203,28 @@ struct Linear3D {
     Tensor d_weight;
     Tensor d_bias;
 
+    // Velocity buffers for momentum
+    Tensor v_weight;
+    Tensor v_bias;
+
     Tensor out;         // [B, S, out_dim]
     Tensor d_out;
 
     uint32_t in_dim;
     uint32_t out_dim;
 
+    static bool use_fp32_acc() {
+        return std::getenv("LINEAR_FP32_ACC") != nullptr;
+    }
+
     Linear3D(uint32_t batch, uint32_t seq, uint32_t in_d, uint32_t out_d, float init, MeshDevice& dev,
-             InitKind init_kind = InitKind::Constant)
+             InitKind init_kind = InitKind::Randn)
         : weight(make_init_tensor(ttnn::Shape({out_d, in_d}), init, dev, init_kind)),
           bias(make_zeros(ttnn::Shape({1, 1, out_d}), dev)),
           d_weight(make_zeros(ttnn::Shape({out_d, in_d}), dev)),
           d_bias(make_zeros(ttnn::Shape({1, 1, out_d}), dev)),
+          v_weight(make_zeros(ttnn::Shape({out_d, in_d}), dev)),
+          v_bias(make_zeros(ttnn::Shape({1, 1, out_d}), dev)),
           out(make_zeros(ttnn::Shape({batch, seq, out_d}), dev)),
           d_out(make_zeros(ttnn::Shape({batch, seq, out_d}), dev)),
           in_dim(in_d),
@@ -218,7 +238,10 @@ struct Linear3D {
         auto* b = g.leaf(&bias, &d_bias, true);
 
         // out = x @ weight.T + bias
-        out = ttnn::add(ttnn::matmul(*x->data, weight, false, true), bias);
+        Tensor mm = use_fp32_acc()
+            ? matmul_fp32_acc(*x->data, weight, false, true)
+            : ttnn::matmul(*x->data, weight, false, true);
+        out = ttnn::add(mm, bias);
 
         auto* v = g.node(&out, &d_out);
         v->parents = {x, w, b};
@@ -229,15 +252,17 @@ struct Linear3D {
 
             // d_input = dout @ weight
             if (x->requires_grad) {
-                x->accumulate_grad(ttnn::matmul(dout, weight));
+                x->accumulate_grad(use_fp32_acc()
+                    ? matmul_fp32_acc(dout, weight, false, false)
+                    : ttnn::matmul(dout, weight));
             }
-            // d_weight = dout.T @ x (summed over batch and seq)
+            // d_weight = sum over batch of dout.T @ x (seq reduced by matmul)
             if (w->requires_grad) {
-                // For 3D: need to reshape or handle carefully
-                // dout: [B, S, out], x: [B, S, in]
-                // d_weight = sum over B,S of dout[b,s,:].T @ x[b,s,:]
-                // Use matmul with transpose_a=true
-                w->accumulate_grad(ttnn::matmul(dout, *x->data, true, false));
+                auto dw = use_fp32_acc()
+                    ? matmul_fp32_acc(dout, *x->data, true, false)
+                    : ttnn::matmul(dout, *x->data, true, false);
+                auto dw_sum = ttnn::sum(dw, 0, false);
+                w->accumulate_grad(dw_sum);
             }
             // d_bias = sum(dout, dims=[0,1])
             if (b->requires_grad) {
@@ -249,9 +274,24 @@ struct Linear3D {
         return v;
     }
 
-    void sgd_step(float lr) {
-        weight = ttnn::subtract(weight, ttnn::multiply(d_weight, lr));
-        bias = ttnn::subtract(bias, ttnn::multiply(d_bias, lr));
+    void sgd_step(float lr, float momentum = 0.0f, float weight_decay = 0.0f) {
+        if (momentum > 0.0f) {
+            // v = momentum * v + grad + wd * weight
+            v_weight = ttnn::add(
+                ttnn::multiply(v_weight, momentum),
+                ttnn::add(d_weight, ttnn::multiply(weight, weight_decay))
+            );
+            v_bias = ttnn::add(ttnn::multiply(v_bias, momentum), d_bias);
+            weight = ttnn::subtract(weight, ttnn::multiply(v_weight, lr));
+            bias = ttnn::subtract(bias, ttnn::multiply(v_bias, lr));
+        } else if (weight_decay > 0.0f) {
+            auto update_w = ttnn::add(d_weight, ttnn::multiply(weight, weight_decay));
+            weight = ttnn::subtract(weight, ttnn::multiply(update_w, lr));
+            bias = ttnn::subtract(bias, ttnn::multiply(d_bias, lr));
+        } else {
+            weight = ttnn::subtract(weight, ttnn::multiply(d_weight, lr));
+            bias = ttnn::subtract(bias, ttnn::multiply(d_bias, lr));
+        }
     }
 };
 
@@ -290,7 +330,7 @@ struct Linear3DBFP8 {
     }
 
     Linear3DBFP8(uint32_t batch, uint32_t seq, uint32_t in_d, uint32_t out_d, float init, MeshDevice& dev,
-                 InitKind init_kind = InitKind::Constant)
+                 InitKind init_kind = InitKind::Randn)
         : weight(make_zeros(ttnn::Shape({out_d, in_d}), dev, ttnn::DataType::BFLOAT8_B)),
           bias(make_zeros(ttnn::Shape({1, 1, out_d}), dev, ttnn::DataType::BFLOAT8_B)),  // BFP8 bias!
           d_weight(make_zeros(ttnn::Shape({out_d, in_d}), dev)),
@@ -448,7 +488,7 @@ struct LinearBFP8MXP {
     }
 
     LinearBFP8MXP(uint32_t batch, uint32_t seq, uint32_t in_d, uint32_t out_d, float init, MeshDevice& dev,
-                  InitKind init_kind = InitKind::Constant)
+                  InitKind init_kind = InitKind::Randn)
         : weight(make_zeros(ttnn::Shape({out_d, in_d}), dev, ttnn::DataType::BFLOAT8_B)),
           bias(make_zeros(ttnn::Shape({1, 1, out_d}), dev, ttnn::DataType::BFLOAT8_B)),
           weight_bf16(make_zeros(ttnn::Shape({out_d, in_d}), dev)),

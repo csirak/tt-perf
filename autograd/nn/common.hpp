@@ -19,6 +19,7 @@
 #include <cmath>
 #include <vector>
 #include <cstdlib>
+#include <optional>
 
 #ifdef TRACY_ENABLE
 #include <tracy/Tracy.hpp>
@@ -72,6 +73,28 @@ inline Tensor make_indices(const std::vector<uint32_t>& indices, const ttnn::Sha
     );
     auto tensor = Tensor::from_vector(indices, ttnn::TensorSpec(shape, tensor_layout));
     return tensor.to_device(&device);
+}
+
+inline ttnn::WormholeComputeKernelConfig get_fp32_acc_compute_config() {
+    return ttnn::WormholeComputeKernelConfig{
+        .math_fidelity = MathFidelity::HiFi2,
+        .math_approx_mode = false,
+        .fp32_dest_acc_en = true,
+        .packer_l1_acc = true,
+    };
+}
+
+inline Tensor matmul_fp32_acc(const Tensor& a, const Tensor& b, bool transpose_a = false, bool transpose_b = false) {
+    return ttnn::matmul(
+        a,
+        b,
+        transpose_a,
+        transpose_b,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        get_fp32_acc_compute_config());
 }
 
 } // namespace static_autograd

@@ -1,13 +1,15 @@
 #pragma once
 
 #include "common.hpp"
+#include "dyt.hpp"
+#include "adam.hpp"
 
 namespace static_autograd {
 
 struct PersistentTransformerLayer {
     // Modules
-    LayerNorm ln1;
-    LayerNorm ln2;
+    DyT ln1;
+    DyT ln2;
     Linear3D wq, wk, wv, wo;
     FFN ffn;
 
@@ -37,9 +39,10 @@ struct PersistentTransformerLayer {
     Tensor causal_mask;                      // [1, S, S]
 
     PersistentTransformerLayer(uint32_t b, uint32_t s, uint32_t d, uint32_t h,
-                                uint32_t ffn_mult, float init, MeshDevice& dev)
-        : ln1(b, s, d, 1e-5f, dev),
-          ln2(b, s, d, 1e-5f, dev),
+                                uint32_t ffn_mult, float init, MeshDevice& dev,
+                                float dyt_alpha = 1.0f)
+        : ln1(b, s, d, dyt_alpha, dev),
+          ln2(b, s, d, dyt_alpha, dev),
           wq(b, s, d, d, init, dev),
           wk(b, s, d, d, init, dev),
           wv(b, s, d, d, init, dev),
@@ -89,18 +92,16 @@ struct PersistentTransformerLayer {
         auto* v_v = wv.forward(g, ln1_v);
 
         // Simplified attention: scores = Q @ K.T * scale
-        attn_scores = ttnn::multiply(ttnn::matmul(*q_v->data, *k_v->data, false, true), scale);
+        attn_scores = ttnn::multiply(matmul_fp32_acc(*q_v->data, *k_v->data, false, true), scale);
 
         // Apply causal mask
         auto scores_masked = ttnn::add(attn_scores, causal_mask);
 
         // Softmax
-        auto x_max = ttnn::max(scores_masked, -1, true);
-        auto x_centered = ttnn::subtract(scores_masked, x_max);
-        attn_weights = ttnn::softmax(x_centered, -1);
+        attn_weights = ttnn::softmax(scores_masked, -1, std::nullopt, get_softmax_compute_config(), true);
 
         // attn_out = attn_weights @ V
-        attn_out = ttnn::matmul(attn_weights, *v_v->data);
+        attn_out = matmul_fp32_acc(attn_weights, *v_v->data);
 
         // Create node for attention output
         auto* attn_v = g.node(&attn_out, &d_attn_out);
@@ -112,26 +113,26 @@ struct PersistentTransformerLayer {
             const auto& dout = *attn_v->grad;
 
             // d_attn_weights = dout @ V.T
-            auto d_attn = ttnn::matmul(dout, *v_v->data, false, true);
+            auto d_attn = matmul_fp32_acc(dout, *v_v->data, false, true);
 
             // d_V = attn_weights.T @ dout
             if (v_v->requires_grad) {
-                v_v->accumulate_grad(ttnn::matmul(attn_weights, dout, true, false));
+                v_v->accumulate_grad(matmul_fp32_acc(attn_weights, dout, true, false));
             }
 
             // Softmax backward
             auto dy_y = ttnn::multiply(d_attn, attn_weights);
-            auto sum_dy_y = ttnn::sum(dy_y, -1, true);
+            auto sum_dy_y = ttnn::sum(dy_y, -1, true, std::nullopt, get_fp32_acc_compute_config());
             auto d_scores = ttnn::multiply(attn_weights, ttnn::subtract(d_attn, sum_dy_y));
             auto d_scores_scaled = ttnn::multiply(d_scores, scale);
 
             // d_Q = d_scores_scaled @ K
             if (q_v->requires_grad) {
-                q_v->accumulate_grad(ttnn::matmul(d_scores_scaled, *k_v->data));
+                q_v->accumulate_grad(matmul_fp32_acc(d_scores_scaled, *k_v->data));
             }
             // d_K = d_scores_scaled.T @ Q
             if (k_v->requires_grad) {
-                k_v->accumulate_grad(ttnn::matmul(d_scores_scaled, *q_v->data, true, false));
+                k_v->accumulate_grad(matmul_fp32_acc(d_scores_scaled, *q_v->data, true, false));
             }
         };
 
@@ -152,51 +153,214 @@ struct PersistentTransformerLayer {
     }
 
     Tensor* execute_forward(const Tensor& x) {
-        auto mean1 = ttnn::mean(x, -1, true);
-        auto centered1 = ttnn::subtract(x, mean1);
-        auto var1 = ttnn::mean(ttnn::multiply(centered1, centered1), -1, true);
-        ln1.rstd = ttnn::rsqrt(ttnn::add(var1, ln1.eps), true);
-        ln1.x_norm = ttnn::multiply(centered1, ln1.rstd);
-        ln1.out = ttnn::add(ttnn::multiply(ln1.gamma, ln1.x_norm), ln1.beta);
+        auto ln1_scaled = ttnn::multiply(x, ln1.alpha);
+        ln1.tanh_out = ttnn::tanh(ln1_scaled);
+        ln1.out = ttnn::add(ttnn::multiply(ln1.gamma, ln1.tanh_out), ln1.beta);
 
         wq.out = ttnn::add(ttnn::matmul(ln1.out, wq.weight, false, true), wq.bias);
         wk.out = ttnn::add(ttnn::matmul(ln1.out, wk.weight, false, true), wk.bias);
         wv.out = ttnn::add(ttnn::matmul(ln1.out, wv.weight, false, true), wv.bias);
 
-        attn_scores = ttnn::multiply(ttnn::matmul(wq.out, wk.out, false, true), scale);
+        attn_scores = ttnn::multiply(matmul_fp32_acc(wq.out, wk.out, false, true), scale);
         auto scores_masked = ttnn::add(attn_scores, causal_mask);
-        auto scores_max = ttnn::max(scores_masked, -1, true);
-        auto scores_centered = ttnn::subtract(scores_masked, scores_max);
-        attn_weights = ttnn::softmax(scores_centered, -1);
+        attn_weights = ttnn::softmax(scores_masked, -1, std::nullopt, get_softmax_compute_config(), true);
 
-        attn_out = ttnn::matmul(attn_weights, wv.out);
+        attn_out = matmul_fp32_acc(attn_weights, wv.out);
         wo.out = ttnn::add(ttnn::matmul(attn_out, wo.weight, false, true), wo.bias);
 
         residual1 = ttnn::add(x, wo.out);
 
-        auto mean2 = ttnn::mean(residual1, -1, true);
-        auto centered2 = ttnn::subtract(residual1, mean2);
-        auto var2 = ttnn::mean(ttnn::multiply(centered2, centered2), -1, true);
-        ln2.rstd = ttnn::rsqrt(ttnn::add(var2, ln2.eps), true);
-        ln2.x_norm = ttnn::multiply(centered2, ln2.rstd);
-        ln2.out = ttnn::add(ttnn::multiply(ln2.gamma, ln2.x_norm), ln2.beta);
+        auto ln2_scaled = ttnn::multiply(residual1, ln2.alpha);
+        ln2.tanh_out = ttnn::tanh(ln2_scaled);
+        ln2.out = ttnn::add(ttnn::multiply(ln2.gamma, ln2.tanh_out), ln2.beta);
 
         ffn.w1.out = ttnn::add(ttnn::matmul(ln2.out, ffn.w1.weight, false, true), ffn.w1.bias);
-        ffn.gelu_out = ttnn::gelu(ffn.w1.out, true);
+        ffn.gelu_out = gelu_forward_tensor(ffn.w1.out);
         ffn.w2.out = ttnn::add(ttnn::matmul(ffn.gelu_out, ffn.w2.weight, false, true), ffn.w2.bias);
 
         output = ttnn::add(residual1, ffn.w2.out);
         return &output;
     }
 
-    void sgd_step(float lr) {
-        ln1.sgd_step(lr);
-        ln2.sgd_step(lr);
-        wq.sgd_step(lr);
-        wk.sgd_step(lr);
-        wv.sgd_step(lr);
-        wo.sgd_step(lr);
-        ffn.sgd_step(lr);
+    void sgd_step(float lr, float momentum = 0.0f, float weight_decay = 0.0f) {
+        ln1.sgd_step(lr, momentum, weight_decay);
+        ln2.sgd_step(lr, momentum, weight_decay);
+        wq.sgd_step(lr, momentum, weight_decay);
+        wk.sgd_step(lr, momentum, weight_decay);
+        wv.sgd_step(lr, momentum, weight_decay);
+        wo.sgd_step(lr, momentum, weight_decay);
+        ffn.sgd_step(lr, momentum, weight_decay);
+    }
+
+    // Register all parameters with Adam optimizer
+    void register_adam(Adam& adam, MeshDevice& dev) {
+        // DyT params (no weight decay)
+        ADAM_REGISTER_DYT(adam, ln1, dev);
+        ADAM_REGISTER_DYT(adam, ln2, dev);
+        // Attention projections
+        ADAM_REGISTER_LINEAR3D(adam, wq, dev);
+        ADAM_REGISTER_LINEAR3D(adam, wk, dev);
+        ADAM_REGISTER_LINEAR3D(adam, wv, dev);
+        ADAM_REGISTER_LINEAR3D(adam, wo, dev);
+        // FFN
+        ADAM_REGISTER_LINEAR3D(adam, ffn.w1, dev);
+        ADAM_REGISTER_LINEAR3D(adam, ffn.w2, dev);
+    }
+};
+
+// =============================================================================
+// PersistentTransformerLayerLN: Transformer layer with LayerNorm (BF16)
+// Used for parity/debug runs to compare against standard LN behavior.
+// =============================================================================
+struct PersistentTransformerLayerLN {
+    LayerNorm ln1;
+    LayerNorm ln2;
+    Linear3D wq, wk, wv, wo;
+    FFN ffn;
+
+    float scale;
+    uint32_t batch, seq, dim, heads, head_dim;
+
+    Tensor q_proj, k_proj, v_proj;
+    Tensor d_q_proj, d_k_proj, d_v_proj;
+    Tensor attn_scores, d_attn_scores;
+    Tensor attn_weights, d_attn_weights;
+    Tensor attn_out, d_attn_out;
+    Tensor attn_proj, d_attn_proj;
+    Tensor residual1, d_residual1;
+    Tensor ffn_out, d_ffn_out;
+    Tensor output, d_output;
+
+    Tensor causal_mask;
+
+    PersistentTransformerLayerLN(uint32_t b, uint32_t s, uint32_t d, uint32_t h,
+                                 uint32_t ffn_mult, float init, MeshDevice& dev,
+                                 float ln_eps)
+        : ln1(b, s, d, ln_eps, dev),
+          ln2(b, s, d, ln_eps, dev),
+          wq(b, s, d, d, init, dev),
+          wk(b, s, d, d, init, dev),
+          wv(b, s, d, d, init, dev),
+          wo(b, s, d, d, init, dev),
+          ffn(b, s, d, d * ffn_mult, init, dev),
+          scale(1.0f / std::sqrt(static_cast<float>(d / h))),
+          batch(b), seq(s), dim(d), heads(h), head_dim(d / h),
+          q_proj(make_zeros(ttnn::Shape({b, s, d}), dev)),
+          k_proj(make_zeros(ttnn::Shape({b, s, d}), dev)),
+          v_proj(make_zeros(ttnn::Shape({b, s, d}), dev)),
+          d_q_proj(make_zeros(ttnn::Shape({b, s, d}), dev)),
+          d_k_proj(make_zeros(ttnn::Shape({b, s, d}), dev)),
+          d_v_proj(make_zeros(ttnn::Shape({b, s, d}), dev)),
+          attn_scores(make_zeros(ttnn::Shape({b, s, s}), dev)),
+          d_attn_scores(make_zeros(ttnn::Shape({b, s, s}), dev)),
+          attn_weights(make_zeros(ttnn::Shape({b, s, s}), dev)),
+          d_attn_weights(make_zeros(ttnn::Shape({b, s, s}), dev)),
+          attn_out(make_zeros(ttnn::Shape({b, s, d}), dev)),
+          d_attn_out(make_zeros(ttnn::Shape({b, s, d}), dev)),
+          attn_proj(make_zeros(ttnn::Shape({b, s, d}), dev)),
+          d_attn_proj(make_zeros(ttnn::Shape({b, s, d}), dev)),
+          residual1(make_zeros(ttnn::Shape({b, s, d}), dev)),
+          d_residual1(make_zeros(ttnn::Shape({b, s, d}), dev)),
+          ffn_out(make_zeros(ttnn::Shape({b, s, d}), dev)),
+          d_ffn_out(make_zeros(ttnn::Shape({b, s, d}), dev)),
+          output(make_zeros(ttnn::Shape({b, s, d}), dev)),
+          d_output(make_zeros(ttnn::Shape({b, s, d}), dev)),
+          causal_mask(PersistentTransformerLayer::create_causal_mask(s, dev)) {}
+
+    Value* forward(Graph& g, Value* x) {
+#ifdef TRACY_ENABLE
+        ZoneScopedN("TransformerLayerLN_forward");
+#endif
+        auto* ln1_v = ln1.forward(g, x);
+        auto* q_v = wq.forward(g, ln1_v);
+        auto* k_v = wk.forward(g, ln1_v);
+        auto* v_v = wv.forward(g, ln1_v);
+
+        attn_scores = ttnn::multiply(matmul_fp32_acc(*q_v->data, *k_v->data, false, true), scale);
+        auto scores_masked = ttnn::add(attn_scores, causal_mask);
+        attn_weights = ttnn::softmax(scores_masked, -1, std::nullopt, get_softmax_compute_config(), true);
+        attn_out = matmul_fp32_acc(attn_weights, *v_v->data);
+
+        auto* attn_v = g.node(&attn_out, &d_attn_out);
+        attn_v->parents = {q_v, k_v, v_v};
+
+        attn_v->backward_fn = [q_v, k_v, v_v, this, attn_v]() {
+            if (!attn_v->grad) return;
+            const auto& dout = *attn_v->grad;
+
+            auto d_attn = matmul_fp32_acc(dout, *v_v->data, false, true);
+            if (v_v->requires_grad) {
+                v_v->accumulate_grad(matmul_fp32_acc(attn_weights, dout, true, false));
+            }
+
+            auto dy_y = ttnn::multiply(d_attn, attn_weights);
+            auto sum_dy_y = ttnn::sum(dy_y, -1, true, std::nullopt, get_fp32_acc_compute_config());
+            auto d_scores = ttnn::multiply(attn_weights, ttnn::subtract(d_attn, sum_dy_y));
+            auto d_scores_scaled = ttnn::multiply(d_scores, scale);
+
+            if (q_v->requires_grad) {
+                q_v->accumulate_grad(matmul_fp32_acc(d_scores_scaled, *k_v->data));
+            }
+            if (k_v->requires_grad) {
+                k_v->accumulate_grad(matmul_fp32_acc(d_scores_scaled, *q_v->data, true, false));
+            }
+        };
+
+        auto* attn_proj_v = wo.forward(g, attn_v);
+        auto* res1_v = add(g, x, attn_proj_v, &residual1, &d_residual1);
+        auto* ln2_v = ln2.forward(g, res1_v);
+        auto* ffn_v = ffn.forward(g, ln2_v);
+        return add(g, res1_v, ffn_v, &output, &d_output);
+    }
+
+    Tensor* execute_forward(const Tensor& x) {
+        ln1.execute_forward(x);
+
+        wq.out = ttnn::add(ttnn::matmul(ln1.out, wq.weight, false, true), wq.bias);
+        wk.out = ttnn::add(ttnn::matmul(ln1.out, wk.weight, false, true), wk.bias);
+        wv.out = ttnn::add(ttnn::matmul(ln1.out, wv.weight, false, true), wv.bias);
+
+        attn_scores = ttnn::multiply(matmul_fp32_acc(wq.out, wk.out, false, true), scale);
+        auto scores_masked = ttnn::add(attn_scores, causal_mask);
+        attn_weights = ttnn::softmax(scores_masked, -1, std::nullopt, get_softmax_compute_config(), true);
+
+        attn_out = matmul_fp32_acc(attn_weights, wv.out);
+        wo.out = ttnn::add(ttnn::matmul(attn_out, wo.weight, false, true), wo.bias);
+
+        residual1 = ttnn::add(x, wo.out);
+        ln2.execute_forward(residual1);
+
+        ffn.w1.out = ttnn::add(ttnn::matmul(ln2.out, ffn.w1.weight, false, true), ffn.w1.bias);
+        ffn.gelu_out = gelu_forward_tensor(ffn.w1.out);
+        ffn.w2.out = ttnn::add(ttnn::matmul(ffn.gelu_out, ffn.w2.weight, false, true), ffn.w2.bias);
+
+        output = ttnn::add(residual1, ffn.w2.out);
+        return &output;
+    }
+
+    void sgd_step(float lr, float momentum = 0.0f, float weight_decay = 0.0f) {
+        ln1.sgd_step(lr, momentum, weight_decay);
+        ln2.sgd_step(lr, momentum, weight_decay);
+        wq.sgd_step(lr, momentum, weight_decay);
+        wk.sgd_step(lr, momentum, weight_decay);
+        wv.sgd_step(lr, momentum, weight_decay);
+        wo.sgd_step(lr, momentum, weight_decay);
+        ffn.sgd_step(lr, momentum, weight_decay);
+    }
+
+    // Register all parameters with Adam optimizer
+    void register_adam(Adam& adam, MeshDevice& dev) {
+        // LayerNorm params (no weight decay)
+        ADAM_REGISTER_LAYERNORM(adam, ln1, dev);
+        ADAM_REGISTER_LAYERNORM(adam, ln2, dev);
+        // Attention projections
+        ADAM_REGISTER_LINEAR3D(adam, wq, dev);
+        ADAM_REGISTER_LINEAR3D(adam, wk, dev);
+        ADAM_REGISTER_LINEAR3D(adam, wv, dev);
+        ADAM_REGISTER_LINEAR3D(adam, wo, dev);
+        // FFN
+        ADAM_REGISTER_LINEAR3D(adam, ffn.w1, dev);
+        ADAM_REGISTER_LINEAR3D(adam, ffn.w2, dev);
     }
 };
 
@@ -282,9 +446,7 @@ struct PersistentTransformerLayerBFP8 {
         auto scores_masked = ttnn::add(attn_scores, causal_mask);
 
         // Softmax
-        auto x_max = ttnn::max(scores_masked, -1, true);
-        auto x_centered = ttnn::subtract(scores_masked, x_max);
-        attn_weights = ttnn::softmax(x_centered, -1);
+        attn_weights = ttnn::softmax(scores_masked, -1, std::nullopt, get_softmax_compute_config(), true);
 
         // attn_out = attn_weights @ V
         attn_out = ttnn::matmul(attn_weights, *v_v->data);
@@ -304,7 +466,7 @@ struct PersistentTransformerLayerBFP8 {
             }
 
             auto dy_y = ttnn::multiply(d_attn, attn_weights);
-            auto sum_dy_y = ttnn::sum(dy_y, -1, true);
+            auto sum_dy_y = ttnn::sum(dy_y, -1, true, std::nullopt, get_fp32_acc_compute_config());
             auto d_scores = ttnn::multiply(attn_weights, ttnn::subtract(d_attn, sum_dy_y));
             auto d_scores_scaled = ttnn::multiply(d_scores, scale);
 
@@ -333,14 +495,14 @@ struct PersistentTransformerLayerBFP8 {
         return add(g, res1_v, ffn_v, &output, &d_output);
     }
 
-    void sgd_step(float lr) {
-        ln1.sgd_step(lr);
-        ln2.sgd_step(lr);
-        wq.sgd_step(lr);
-        wk.sgd_step(lr);
-        wv.sgd_step(lr);
-        wo.sgd_step(lr);
-        ffn.sgd_step(lr);
+    void sgd_step(float lr, float momentum = 0.0f, float weight_decay = 0.0f) {
+        ln1.sgd_step(lr, momentum, weight_decay);
+        ln2.sgd_step(lr, momentum, weight_decay);
+        wq.sgd_step(lr, momentum, weight_decay);
+        wk.sgd_step(lr, momentum, weight_decay);
+        wv.sgd_step(lr, momentum, weight_decay);
+        wo.sgd_step(lr, momentum, weight_decay);
+        ffn.sgd_step(lr, momentum, weight_decay);
     }
 };
 

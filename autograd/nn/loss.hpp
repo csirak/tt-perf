@@ -4,6 +4,51 @@
 
 namespace static_autograd {
 
+struct MeanSquaredError {
+    Tensor diff;
+    Tensor sq;
+    Tensor sum;
+    Tensor loss;
+    Tensor d_loss;
+
+    uint32_t numel;
+
+    MeanSquaredError(uint32_t b, uint32_t s, uint32_t d, MeshDevice& dev)
+        : diff(make_zeros(ttnn::Shape({b, s, d}), dev)),
+          sq(make_zeros(ttnn::Shape({b, s, d}), dev)),
+          sum(make_zeros(ttnn::Shape({1}), dev)),
+          loss(make_zeros(ttnn::Shape({1}), dev)),
+          d_loss(make_zeros(ttnn::Shape({1}), dev)),
+          numel(b * s * d) {}
+
+    Value* build(Graph& g, Value* pred, Value* target) {
+        auto* v = g.node(&loss, &d_loss);
+        v->parents = {pred, target};
+        v->backward_fn = [pred, target, this, v]() {
+            if (!v->grad) return;
+            auto diff_local = ttnn::subtract(*pred->data, *target->data);
+            auto grad = ttnn::multiply(diff_local, 2.0f / static_cast<float>(numel));
+            grad = ttnn::multiply(grad, *v->grad);
+            pred->accumulate_grad(grad);
+        };
+        return v;
+    }
+
+    void execute_forward(const Tensor& pred, const Tensor& target) {
+        diff = ttnn::subtract(pred, target);
+        sq = ttnn::multiply(diff, diff);
+        auto sum0 = ttnn::sum(sq, 0, true);
+        auto sum01 = ttnn::sum(sum0, 1, true);
+        sum = ttnn::sum(sum01, 2, true);
+        sum = ttnn::reshape(sum, ttnn::Shape({1}));
+        loss = ttnn::multiply(sum, 1.0f / static_cast<float>(numel));
+    }
+
+    float get_loss() {
+        return static_cast<float>(loss.cpu().to_vector<bfloat16>()[0]);
+    }
+};
+
 struct LastTokenCrossEntropy {
     Tensor row_mask;      // [B*S, C]
     Tensor row_mask_1d;   // [B*S]
@@ -89,6 +134,8 @@ struct LastTokenCrossEntropy {
             auto grad_logits = ttnn::subtract(softmax, one_hot);
             grad_logits = ttnn::multiply(grad_logits, row_mask);
             grad_logits = ttnn::multiply(grad_logits, 1.0f / static_cast<float>(batch));
+            // Scale by upstream gradient (loss scale or dL/dloss)
+            grad_logits = ttnn::multiply(grad_logits, *v->grad);
             grad_logits = ttnn::reshape(grad_logits, ttnn::Shape({batch, seq, classes}));
             logits->accumulate_grad(grad_logits);
         };
@@ -106,7 +153,7 @@ struct LastTokenCrossEntropy {
         auto indices = make_indices(index_buf, ttnn::Shape({batch * seq}), *device);
         one_hot = ttnn::embedding(indices, one_hot_weight, std::nullopt, ttnn::TILE_LAYOUT);
 
-        softmax = ttnn::softmax(flat_logits, -1);
+        softmax = ttnn::softmax(flat_logits, -1, std::nullopt, get_softmax_compute_config(), true);
         log_probs = ttnn::log(softmax);
         auto nll_raw = ttnn::sum(ttnn::multiply(one_hot, log_probs), -1, false);
         nll = ttnn::multiply(nll_raw, -1.0f);

@@ -1,0 +1,22 @@
+# Grok verify with per-step dumps (LayerNorm)
+p: 127
+train_frac: 0.5
+pad_to: 32
+batch_size: 256
+steps: 10
+log_every: 1
+eval_every: 0
+seed: 0
+lr: 0.001
+loss_scale: 1.0
+dim: 128
+heads: 4
+ffn_mult: 4
+layers: 2
+use_layer_norm: 1
+ln_eps: 1e-5
+dump_outputs: 1
+dump_dir: /home/howard/ttnn-perf/experiments/grok/outputs/cpp
+
+dump_steps: 10
+dump_steps_dir: /home/howard/ttnn-perf/experiments/grok/outputs/steps

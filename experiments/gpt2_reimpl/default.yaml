@@ -1,0 +1,27 @@
+# GPT2 reimplementation parity config
+
+data_dir: /home/howard/ttnn-perf/experiments/gpt2_reimpl/data
+outputs_dir: /home/howard/ttnn-perf/experiments/gpt2_reimpl/outputs
+
+batch_size: 32
+seq: 32
+dim: 128
+heads: 4
+ffn_mult: 4
+vocab: 160
+
+steps: 1000
+lr: 1e-3
+beta1: 0.9
+beta2: 0.999
+eps: 1e-8
+weight_decay: 0.01
+log_every: 50
+
+seed: 1
+init_std: 0.02
+ln_eps: 1e-5
+
+# Dump controls
+# 1 = dump, 0 = no dump
+dump_outputs: 1

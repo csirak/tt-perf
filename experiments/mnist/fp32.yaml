@@ -1,0 +1,22 @@
+# MNIST MLP parity config (FP32 accumulate matmul)
+
+data_dir: /home/howard/ttnn-perf/experiments/mnist/data
+outputs_dir: /home/howard/ttnn-perf/experiments/mnist/outputs_fp32
+
+train_samples: 256
+seed: 1
+pad_to: 1024
+num_classes: 32
+
+hidden_dim: 256
+init_std: 0.02
+
+batch_size: 32
+steps: 10
+lr: 1e-3
+beta1: 0.9
+beta2: 0.999
+eps: 1e-8
+weight_decay: 1e-2
+
+dump_steps: 10

@@ -1,0 +1,27 @@
+# Test config for fp32 master weights
+p: 97
+train_frac: 0.5
+pad_to: 32
+batch_size: 32
+steps: 500
+log_every: 10
+eval_every: 50
+seed: 42
+
+optimizer: adam
+lr: 0.001
+beta1: 0.9
+beta2: 0.999
+eps: 1e-6
+weight_decay: 0.01
+
+# Small model for debugging (must be multiples of 32)
+dim: 64
+heads: 2
+ffn_mult: 2
+layers: 1
+use_layer_norm: 1
+ln_eps: 1e-5
+loss_scale: 1.0
+
+csv: /home/howard/ttnn-perf/experiments/grok/test_fp32.csv

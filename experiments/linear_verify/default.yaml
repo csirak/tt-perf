@@ -1,0 +1,12 @@
+# Linear verify config (BF16)
+# stage: 0 = Linear only
+# stage: 1 = Linear -> LayerNorm
+batch_size: 256
+seq: 32
+in_dim: 128
+out_dim: 128
+stage: 0
+seed: 1
+eps: 1e-5
+dump_outputs: 1
+dump_dir: /home/howard/ttnn-perf/experiments/linear_verify/outputs/cpp

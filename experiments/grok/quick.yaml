@@ -1,0 +1,15 @@
+# Grokking quick sanity config
+p: 127
+train_frac: 0.5
+pad_to: 32
+batch_size: 256
+steps: 1
+log_every: 1
+eval_every: 0
+seed: 0
+lr: 0.001
+dim: 128
+heads: 4
+ffn_mult: 4
+layers: 2
+loss_scale: 1.0

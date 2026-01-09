@@ -1,0 +1,11 @@
+# Linear + DyT verify
+batch_size: 256
+seq: 32
+in_dim: 128
+out_dim: 128
+stage: 2
+seed: 1
+eps: 1e-5
+dyt_alpha: 1.0
+dump_outputs: 1
+dump_dir: /home/howard/ttnn-perf/experiments/linear_verify/outputs/cpp/linear_dyt

@@ -1,0 +1,27 @@
+# Grok training config with Adam optimizer (1k steps) for scale test
+
+p: 127
+train_frac: 0.8
+pad_to: 32
+batch_size: 256
+steps: 1000
+log_every: 100
+eval_every: 100
+seed: 0
+
+optimizer: adam
+lr: 0.001
+beta1: 0.9
+beta2: 0.999
+eps: 1e-6
+weight_decay: 0.01
+
+dim: 128
+heads: 4
+ffn_mult: 4
+layers: 2
+use_layer_norm: 1
+ln_eps: 1e-5
+loss_scale: 1.0
+
+csv: /home/howard/ttnn-perf/experiments/grok/adam_ln_builtin_1k_results.csv

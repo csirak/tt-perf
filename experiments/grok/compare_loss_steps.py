@@ -40,7 +40,8 @@ def ffn(x, w1, b1, w2, b2, dtype, approx: str = "tanh"):
 
 
 def causal_mask(seq, dtype):
-    return torch.triu(torch.full((1, seq, seq), -1e9, dtype=dtype), diagonal=1)
+    mask = torch.triu(torch.full((seq, seq), -1e9, dtype=dtype), diagonal=1)
+    return mask.unsqueeze(0).unsqueeze(0)
 
 
 def parse_cpp_loss(path: Path) -> dict:
@@ -102,13 +103,20 @@ def main():
     ln_eps = float(meta.get("ln_eps", 1e-5))
 
     dtype = torch.bfloat16
-    scale = 1.0 / (dim // heads) ** 0.5
+    head_dim = dim // heads
+    scale = 1.0 / head_dim ** 0.5
 
     tok_weight = load_tensor(str(cpp_dir / "tok_weight.bin")).to(dtype).requires_grad_()
     pos_weight = load_tensor(str(cpp_dir / "pos_weight.bin")).to(dtype).requires_grad_()
 
     params = [tok_weight, pos_weight]
     layer_params = []
+    ln_final_gamma = None
+    ln_final_beta = None
+    if use_layer_norm:
+        ln_final_gamma = load_tensor(str(cpp_dir / "ln_final_gamma.bin")).to(dtype).requires_grad_()
+        ln_final_beta = load_tensor(str(cpp_dir / "ln_final_beta.bin")).to(dtype).requires_grad_()
+        params.extend([ln_final_gamma, ln_final_beta])
     for layer in range(layers):
         prefix = f"layer{layer}"
         if use_layer_norm:
@@ -171,6 +179,10 @@ def main():
     step_ids = [int(p.stem.split("_")[1]) for p in step_tokens]
     step_ids.sort()
 
+    cpp_losses = parse_cpp_loss(steps_dir / "loss_cpp.tsv")
+    if cpp_losses:
+        step_ids = [step for step in step_ids if step in cpp_losses]
+
     header = ["step", "tok_plus_pos_l2", "tok_plus_pos_l1"]
     for i in range(layers):
         header += [
@@ -212,12 +224,16 @@ def main():
             q = linear3d(ln1_out, wq_w, wq_b, dtype)
             k = linear3d(ln1_out, wk_w, wk_b, dtype)
             v = linear3d(ln1_out, wv_w, wv_b, dtype)
-            scores = (torch.matmul(q, k.transpose(-1, -2)) * scale).to(dtype)
+            qh = q.view(batch, seq, heads, head_dim).transpose(1, 2)
+            kh = k.view(batch, seq, heads, head_dim).transpose(1, 2)
+            vh = v.view(batch, seq, heads, head_dim).transpose(1, 2)
+            scores = torch.matmul(qh, kh.transpose(-1, -2)) * torch.tensor(scale, dtype=dtype)
             scores_masked = (scores + mask).to(dtype)
             scores_max = scores_masked.max(dim=-1, keepdim=True).values.to(dtype)
             scores_centered = (scores_masked - scores_max).to(dtype)
             attn_weights = torch.softmax(scores_centered, dim=-1).to(dtype)
-            attn_out = torch.matmul(attn_weights, v).to(dtype)
+            attn_out_heads = torch.matmul(attn_weights, vh).to(dtype)
+            attn_out = attn_out_heads.transpose(1, 2).contiguous().view(batch, seq, dim)
             row += [*l2_l1(attn_out)]
             wo_out = linear3d(attn_out, wo_w, wo_b, dtype)
             residual1 = (h + wo_out).to(dtype)
@@ -231,6 +247,8 @@ def main():
             h = (residual1 + ffn_out).to(dtype)
             row += [*l2_l1(h)]
 
+        if use_layer_norm:
+            h = layer_norm(h, ln_final_gamma, ln_final_beta, ln_eps, dtype)
         logits = linear3d(h, out_w, out_b, dtype)
         row += [*l2_l1(logits)]
         append_act_row(act_out, header, row)
@@ -260,7 +278,6 @@ def main():
             p.data = p.data - lr * p.grad
             p.grad = None
 
-    cpp_losses = parse_cpp_loss(steps_dir / "loss_cpp.tsv")
     cpp_grad_norms = parse_cpp_loss(steps_dir / "grad_norm_cpp.tsv")
 
     lines = [

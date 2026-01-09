@@ -1,0 +1,10 @@
+# Embedding backward verify config
+
+batch: 32
+seq: 32
+vocab: 128
+dim: 128
+seed: 1
+init_std: 0.02
+
+dump_dir: /home/howard/ttnn-perf/experiments/grok/outputs/embedding_bw

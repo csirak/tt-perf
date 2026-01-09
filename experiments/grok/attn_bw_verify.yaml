@@ -1,0 +1,10 @@
+# Attention backward verify config
+
+batch: 32
+seq: 32
+dim: 128
+heads: 4
+seed: 1
+init_std: 0.02
+
+dump_dir: /home/howard/ttnn-perf/experiments/grok/outputs/attn_bw

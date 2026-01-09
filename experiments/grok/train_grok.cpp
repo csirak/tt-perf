@@ -20,7 +20,10 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <system_error>
 #include <string>
+#include <type_traits>
+#include <utility>
 
 using namespace static_autograd;
 using MeshDevice = tt::tt_metal::distributed::MeshDevice;
@@ -55,6 +58,12 @@ struct DeviceGuard {
 
     MeshDevice& get() { return *device; }
 };
+
+template <typename T, typename = void>
+struct has_ln_final : std::false_type {};
+
+template <typename T>
+struct has_ln_final<T, std::void_t<decltype(std::declval<T>().ln_final)>> : std::true_type {};
 
 struct Config {
     uint32_t p = 127;
@@ -140,10 +149,64 @@ void append_csv(const std::string& path, uint32_t step, float train_loss, float 
     if (!file) {
         return;
     }
+    const bool is_tsv = path.size() >= 4 && path.rfind(".tsv") == (path.size() - 4);
+    const char delim = is_tsv ? '\t' : ',';
+    const double avg_step_s = (step > 0) ? (total_s / static_cast<double>(step)) : 0.0;
+
     if (write_header) {
-        file << "step,train_loss,val_loss,interval_s,total_s\n";
+        file << "step" << delim
+             << "train_loss" << delim
+             << "val_loss" << delim
+             << "interval_s" << delim
+             << "total_s" << delim
+             << "avg_step_s\n";
     }
-    file << step << "," << train_loss << "," << val_loss << "," << interval_s << "," << total_s << "\n";
+    file << step << delim
+         << train_loss << delim
+         << val_loss << delim
+         << interval_s << delim
+         << total_s << delim
+         << avg_step_s << "\n";
+}
+
+void init_csv(const std::string& path) {
+    if (path.empty()) {
+        return;
+    }
+    const bool is_tsv = path.size() >= 4 && path.rfind(".tsv") == (path.size() - 4);
+    const char delim = is_tsv ? '\t' : ',';
+    std::ofstream file(path, std::ios::trunc);
+    if (!file) {
+        return;
+    }
+    file << "step" << delim
+         << "train_loss" << delim
+         << "val_loss" << delim
+         << "interval_s" << delim
+         << "total_s" << delim
+         << "avg_step_s\n";
+}
+
+void clear_step_files(const std::string& dir) {
+    if (dir.empty()) {
+        return;
+    }
+    std::error_code ec;
+    if (!std::filesystem::exists(dir, ec)) {
+        return;
+    }
+    for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+        if (ec) {
+            break;
+        }
+        if (!entry.is_regular_file(ec)) {
+            continue;
+        }
+        const auto name = entry.path().filename().string();
+        if (name.rfind("step_", 0) == 0) {
+            std::filesystem::remove(entry.path(), ec);
+        }
+    }
 }
 
 Tensor make_host_bf16(const std::vector<uint32_t>& data, const ttnn::Shape& shape) {
@@ -266,6 +329,12 @@ void dump_grok_outputs(const std::string& dir,
         traced::save_tensor(layer.ffn.gelu_out, (std::filesystem::path(dir) / (prefix + "_ffn_gelu.bin")).string(), &device);
         traced::save_tensor(layer.ffn.w2.out, (std::filesystem::path(dir) / (prefix + "_ffn_w2.bin")).string(), &device);
         traced::save_tensor(layer.output, (std::filesystem::path(dir) / (prefix + "_output.bin")).string(), &device);
+    }
+
+    if constexpr (has_ln_final<Model>::value) {
+        auto base = std::filesystem::path(dir);
+        save_norm_params(base, "ln_final", model.ln_final, device);
+        traced::save_tensor(model.ln_final.out, (base / "ln_final.bin").string(), &device);
     }
 
     traced::save_tensor(model.output_proj.out, (std::filesystem::path(dir) / "logits.bin").string(), &device);
@@ -489,6 +558,10 @@ void dump_grok_gradients(const std::string& dir,
                             (std::filesystem::path(dir) / (prefix + "_ffn_w2_bias_grad.bin")).string(), &device);
     }
 
+    if constexpr (has_ln_final<Model>::value) {
+        save_norm_grads(std::filesystem::path(dir), "ln_final", model.ln_final, device);
+    }
+
     traced::save_tensor(model.output_proj.d_weight,
                         (std::filesystem::path(dir) / "output_weight_grad.bin").string(), &device);
     traced::save_tensor(model.output_proj.d_bias,
@@ -553,10 +626,12 @@ int run_train(const Config& cfg, MeshDevice& device, ModelFactory make_model) {
     const auto act_steps_path = (std::filesystem::path(cfg.dump_steps_dir) / "act_norms_cpp.tsv").string();
     if (cfg.dump_steps > 0) {
         ensure_dir(cfg.dump_steps_dir);
+        clear_step_files(cfg.dump_steps_dir);
         std::filesystem::remove(loss_steps_path);
         std::filesystem::remove(grad_steps_path);
         std::filesystem::remove(act_steps_path);
     }
+    init_csv(cfg.csv_path);
 
     for (uint32_t step = 1; step <= cfg.steps; ++step) {
         auto batch = dataset.sample_batch(cfg.batch_size, true);

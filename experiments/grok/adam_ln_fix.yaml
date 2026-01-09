@@ -1,0 +1,29 @@
+# Grok training config (Adam) with manual LayerNorm (no moreh)
+
+p: 127
+train_frac: 0.8
+pad_to: 32
+batch_size: 256
+steps: 5000
+log_every: 500
+eval_every: 500
+seed: 0
+
+# Adam optimizer
+optimizer: adam
+lr: 0.001
+beta1: 0.9
+beta2: 0.999
+eps: 1e-6
+weight_decay: 0.01
+
+# Model config
+dim: 128
+heads: 4
+ffn_mult: 4
+layers: 2
+use_layer_norm: 1
+ln_eps: 1e-5
+loss_scale: 1.0
+
+csv: /home/howard/ttnn-perf/experiments/grok/adam_ln_fix_results.csv

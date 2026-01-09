@@ -3,8 +3,28 @@
 #include "common.hpp"
 #include "dyt.hpp"
 #include "adam.hpp"
+#include <ttnn/operations/data_movement/permute/permute.hpp>
 
 namespace static_autograd {
+
+inline float attn_scale(uint32_t dim, uint32_t heads) {
+    if (std::getenv("ATTN_SCALE_FULL_DIM")) {
+        return 1.0f / std::sqrt(static_cast<float>(dim));
+    }
+    return 1.0f / std::sqrt(static_cast<float>(dim / heads));
+}
+
+inline Tensor split_heads(const Tensor& x, uint32_t batch, uint32_t seq, uint32_t heads, uint32_t head_dim) {
+    auto reshaped = ttnn::reshape(x, ttnn::Shape({batch, seq, heads, head_dim}));
+    ttnn::SmallVector<int64_t> dims = {0, 2, 1, 3};
+    return ttnn::permute(reshaped, dims);
+}
+
+inline Tensor merge_heads(const Tensor& x, uint32_t batch, uint32_t seq, uint32_t heads, uint32_t head_dim) {
+    ttnn::SmallVector<int64_t> dims = {0, 2, 1, 3};
+    auto permuted = ttnn::permute(x, dims);
+    return ttnn::reshape(permuted, ttnn::Shape({batch, seq, heads * head_dim}));
+}
 
 struct PersistentTransformerLayer {
     // Modules
@@ -18,12 +38,14 @@ struct PersistentTransformerLayer {
     uint32_t batch, seq, dim, heads, head_dim;
 
     // Forward buffers
-    Tensor q_proj, k_proj, v_proj;          // [B, S, D]
+    Tensor q_proj, k_proj, v_proj;           // [B, S, D]
     Tensor d_q_proj, d_k_proj, d_v_proj;
-    Tensor attn_scores;                      // [B, S, S] simplified (single head view)
+    Tensor q_heads, k_heads, v_heads;        // [B, H, S, Dh]
+    Tensor attn_scores;                      // [B, H, S, S]
     Tensor d_attn_scores;
-    Tensor attn_weights;                     // [B, S, S]
+    Tensor attn_weights;                     // [B, H, S, S]
     Tensor d_attn_weights;
+    Tensor attn_out_heads;                   // [B, H, S, Dh]
     Tensor attn_out;                         // [B, S, D]
     Tensor d_attn_out;
     Tensor attn_proj;                        // [B, S, D]
@@ -36,7 +58,7 @@ struct PersistentTransformerLayer {
     Tensor d_output;
 
     // Causal mask
-    Tensor causal_mask;                      // [1, S, S]
+    Tensor causal_mask;                      // [1, 1, S, S]
 
     PersistentTransformerLayer(uint32_t b, uint32_t s, uint32_t d, uint32_t h,
                                 uint32_t ffn_mult, float init, MeshDevice& dev,
@@ -48,7 +70,7 @@ struct PersistentTransformerLayer {
           wv(b, s, d, d, init, dev),
           wo(b, s, d, d, init, dev),
           ffn(b, s, d, d * ffn_mult, init, dev),
-          scale(1.0f / std::sqrt(static_cast<float>(d / h))),
+          scale(attn_scale(d, h)),
           batch(b), seq(s), dim(d), heads(h), head_dim(d / h),
           q_proj(make_zeros(ttnn::Shape({b, s, d}), dev)),
           k_proj(make_zeros(ttnn::Shape({b, s, d}), dev)),
@@ -56,10 +78,14 @@ struct PersistentTransformerLayer {
           d_q_proj(make_zeros(ttnn::Shape({b, s, d}), dev)),
           d_k_proj(make_zeros(ttnn::Shape({b, s, d}), dev)),
           d_v_proj(make_zeros(ttnn::Shape({b, s, d}), dev)),
-          attn_scores(make_zeros(ttnn::Shape({b, s, s}), dev)),
-          d_attn_scores(make_zeros(ttnn::Shape({b, s, s}), dev)),
-          attn_weights(make_zeros(ttnn::Shape({b, s, s}), dev)),
-          d_attn_weights(make_zeros(ttnn::Shape({b, s, s}), dev)),
+          q_heads(make_zeros(ttnn::Shape({b, h, s, head_dim}), dev)),
+          k_heads(make_zeros(ttnn::Shape({b, h, s, head_dim}), dev)),
+          v_heads(make_zeros(ttnn::Shape({b, h, s, head_dim}), dev)),
+          attn_scores(make_zeros(ttnn::Shape({b, h, s, s}), dev)),
+          d_attn_scores(make_zeros(ttnn::Shape({b, h, s, s}), dev)),
+          attn_weights(make_zeros(ttnn::Shape({b, h, s, s}), dev)),
+          d_attn_weights(make_zeros(ttnn::Shape({b, h, s, s}), dev)),
+          attn_out_heads(make_zeros(ttnn::Shape({b, h, s, head_dim}), dev)),
           attn_out(make_zeros(ttnn::Shape({b, s, d}), dev)),
           d_attn_out(make_zeros(ttnn::Shape({b, s, d}), dev)),
           attn_proj(make_zeros(ttnn::Shape({b, s, d}), dev)),
@@ -73,7 +99,7 @@ struct PersistentTransformerLayer {
           causal_mask(create_causal_mask(s, dev)) {}
 
     static Tensor create_causal_mask(uint32_t s, MeshDevice& dev) {
-        auto mask = make_full(ttnn::Shape({1, s, s}), -1e9f, dev);
+        auto mask = make_full(ttnn::Shape({1, 1, s, s}), -1e9f, dev);
         return ttnn::triu(mask, 1);
     }
 
@@ -91,17 +117,17 @@ struct PersistentTransformerLayer {
         auto* k_v = wk.forward(g, ln1_v);
         auto* v_v = wv.forward(g, ln1_v);
 
-        // Simplified attention: scores = Q @ K.T * scale
-        attn_scores = ttnn::multiply(matmul_fp32_acc(*q_v->data, *k_v->data, false, true), scale);
+        // Multi-head attention
+        q_heads = split_heads(*q_v->data, batch, seq, heads, head_dim);
+        k_heads = split_heads(*k_v->data, batch, seq, heads, head_dim);
+        v_heads = split_heads(*v_v->data, batch, seq, heads, head_dim);
 
-        // Apply causal mask
+        attn_scores = ttnn::multiply(matmul_fp32_acc(q_heads, k_heads, false, true), scale);
         auto scores_masked = ttnn::add(attn_scores, causal_mask);
-
-        // Softmax
         attn_weights = ttnn::softmax(scores_masked, -1, std::nullopt, get_softmax_compute_config(), true);
 
-        // attn_out = attn_weights @ V
-        attn_out = matmul_fp32_acc(attn_weights, *v_v->data);
+        attn_out_heads = matmul_fp32_acc(attn_weights, v_heads);
+        attn_out = merge_heads(attn_out_heads, batch, seq, heads, head_dim);
 
         // Create node for attention output
         auto* attn_v = g.node(&attn_out, &d_attn_out);
@@ -112,12 +138,16 @@ struct PersistentTransformerLayer {
             if (!attn_v->grad) return;
             const auto& dout = *attn_v->grad;
 
-            // d_attn_weights = dout @ V.T
-            auto d_attn = matmul_fp32_acc(dout, *v_v->data, false, true);
+            // Reshape upstream gradient to heads
+            auto d_out_heads = split_heads(dout, batch, seq, heads, head_dim);
 
-            // d_V = attn_weights.T @ dout
+            // d_attn = d_out_heads @ V.T
+            auto d_attn = matmul_fp32_acc(d_out_heads, v_heads, false, true);
+
+            // d_V = attn_weights.T @ d_out_heads
             if (v_v->requires_grad) {
-                v_v->accumulate_grad(matmul_fp32_acc(attn_weights, dout, true, false));
+                auto d_v_heads = matmul_fp32_acc(attn_weights, d_out_heads, true, false);
+                v_v->accumulate_grad(merge_heads(d_v_heads, batch, seq, heads, head_dim));
             }
 
             // Softmax backward
@@ -128,11 +158,13 @@ struct PersistentTransformerLayer {
 
             // d_Q = d_scores_scaled @ K
             if (q_v->requires_grad) {
-                q_v->accumulate_grad(matmul_fp32_acc(d_scores_scaled, *k_v->data));
+                auto d_q_heads = matmul_fp32_acc(d_scores_scaled, k_heads);
+                q_v->accumulate_grad(merge_heads(d_q_heads, batch, seq, heads, head_dim));
             }
             // d_K = d_scores_scaled.T @ Q
             if (k_v->requires_grad) {
-                k_v->accumulate_grad(matmul_fp32_acc(d_scores_scaled, *q_v->data, true, false));
+                auto d_k_heads = matmul_fp32_acc(d_scores_scaled, q_heads, true, false);
+                k_v->accumulate_grad(merge_heads(d_k_heads, batch, seq, heads, head_dim));
             }
         };
 
@@ -161,11 +193,16 @@ struct PersistentTransformerLayer {
         wk.out = ttnn::add(ttnn::matmul(ln1.out, wk.weight, false, true), wk.bias);
         wv.out = ttnn::add(ttnn::matmul(ln1.out, wv.weight, false, true), wv.bias);
 
-        attn_scores = ttnn::multiply(matmul_fp32_acc(wq.out, wk.out, false, true), scale);
+        q_heads = split_heads(wq.out, batch, seq, heads, head_dim);
+        k_heads = split_heads(wk.out, batch, seq, heads, head_dim);
+        v_heads = split_heads(wv.out, batch, seq, heads, head_dim);
+
+        attn_scores = ttnn::multiply(matmul_fp32_acc(q_heads, k_heads, false, true), scale);
         auto scores_masked = ttnn::add(attn_scores, causal_mask);
         attn_weights = ttnn::softmax(scores_masked, -1, std::nullopt, get_softmax_compute_config(), true);
 
-        attn_out = matmul_fp32_acc(attn_weights, wv.out);
+        attn_out_heads = matmul_fp32_acc(attn_weights, v_heads);
+        attn_out = merge_heads(attn_out_heads, batch, seq, heads, head_dim);
         wo.out = ttnn::add(ttnn::matmul(attn_out, wo.weight, false, true), wo.bias);
 
         residual1 = ttnn::add(x, wo.out);
@@ -223,8 +260,10 @@ struct PersistentTransformerLayerLN {
 
     Tensor q_proj, k_proj, v_proj;
     Tensor d_q_proj, d_k_proj, d_v_proj;
+    Tensor q_heads, k_heads, v_heads;
     Tensor attn_scores, d_attn_scores;
     Tensor attn_weights, d_attn_weights;
+    Tensor attn_out_heads;
     Tensor attn_out, d_attn_out;
     Tensor attn_proj, d_attn_proj;
     Tensor residual1, d_residual1;
@@ -243,7 +282,7 @@ struct PersistentTransformerLayerLN {
           wv(b, s, d, d, init, dev),
           wo(b, s, d, d, init, dev),
           ffn(b, s, d, d * ffn_mult, init, dev),
-          scale(1.0f / std::sqrt(static_cast<float>(d / h))),
+          scale(attn_scale(d, h)),
           batch(b), seq(s), dim(d), heads(h), head_dim(d / h),
           q_proj(make_zeros(ttnn::Shape({b, s, d}), dev)),
           k_proj(make_zeros(ttnn::Shape({b, s, d}), dev)),
@@ -251,10 +290,14 @@ struct PersistentTransformerLayerLN {
           d_q_proj(make_zeros(ttnn::Shape({b, s, d}), dev)),
           d_k_proj(make_zeros(ttnn::Shape({b, s, d}), dev)),
           d_v_proj(make_zeros(ttnn::Shape({b, s, d}), dev)),
-          attn_scores(make_zeros(ttnn::Shape({b, s, s}), dev)),
-          d_attn_scores(make_zeros(ttnn::Shape({b, s, s}), dev)),
-          attn_weights(make_zeros(ttnn::Shape({b, s, s}), dev)),
-          d_attn_weights(make_zeros(ttnn::Shape({b, s, s}), dev)),
+          q_heads(make_zeros(ttnn::Shape({b, h, s, head_dim}), dev)),
+          k_heads(make_zeros(ttnn::Shape({b, h, s, head_dim}), dev)),
+          v_heads(make_zeros(ttnn::Shape({b, h, s, head_dim}), dev)),
+          attn_scores(make_zeros(ttnn::Shape({b, h, s, s}), dev)),
+          d_attn_scores(make_zeros(ttnn::Shape({b, h, s, s}), dev)),
+          attn_weights(make_zeros(ttnn::Shape({b, h, s, s}), dev)),
+          d_attn_weights(make_zeros(ttnn::Shape({b, h, s, s}), dev)),
+          attn_out_heads(make_zeros(ttnn::Shape({b, h, s, head_dim}), dev)),
           attn_out(make_zeros(ttnn::Shape({b, s, d}), dev)),
           d_attn_out(make_zeros(ttnn::Shape({b, s, d}), dev)),
           attn_proj(make_zeros(ttnn::Shape({b, s, d}), dev)),
@@ -276,10 +319,15 @@ struct PersistentTransformerLayerLN {
         auto* k_v = wk.forward(g, ln1_v);
         auto* v_v = wv.forward(g, ln1_v);
 
-        attn_scores = ttnn::multiply(matmul_fp32_acc(*q_v->data, *k_v->data, false, true), scale);
+        q_heads = split_heads(*q_v->data, batch, seq, heads, head_dim);
+        k_heads = split_heads(*k_v->data, batch, seq, heads, head_dim);
+        v_heads = split_heads(*v_v->data, batch, seq, heads, head_dim);
+
+        attn_scores = ttnn::multiply(matmul_fp32_acc(q_heads, k_heads, false, true), scale);
         auto scores_masked = ttnn::add(attn_scores, causal_mask);
         attn_weights = ttnn::softmax(scores_masked, -1, std::nullopt, get_softmax_compute_config(), true);
-        attn_out = matmul_fp32_acc(attn_weights, *v_v->data);
+        attn_out_heads = matmul_fp32_acc(attn_weights, v_heads);
+        attn_out = merge_heads(attn_out_heads, batch, seq, heads, head_dim);
 
         auto* attn_v = g.node(&attn_out, &d_attn_out);
         attn_v->parents = {q_v, k_v, v_v};
@@ -288,9 +336,11 @@ struct PersistentTransformerLayerLN {
             if (!attn_v->grad) return;
             const auto& dout = *attn_v->grad;
 
-            auto d_attn = matmul_fp32_acc(dout, *v_v->data, false, true);
+            auto d_out_heads = split_heads(dout, batch, seq, heads, head_dim);
+            auto d_attn = matmul_fp32_acc(d_out_heads, v_heads, false, true);
             if (v_v->requires_grad) {
-                v_v->accumulate_grad(matmul_fp32_acc(attn_weights, dout, true, false));
+                auto d_v_heads = matmul_fp32_acc(attn_weights, d_out_heads, true, false);
+                v_v->accumulate_grad(merge_heads(d_v_heads, batch, seq, heads, head_dim));
             }
 
             auto dy_y = ttnn::multiply(d_attn, attn_weights);
@@ -299,10 +349,12 @@ struct PersistentTransformerLayerLN {
             auto d_scores_scaled = ttnn::multiply(d_scores, scale);
 
             if (q_v->requires_grad) {
-                q_v->accumulate_grad(matmul_fp32_acc(d_scores_scaled, *k_v->data));
+                auto d_q_heads = matmul_fp32_acc(d_scores_scaled, k_heads);
+                q_v->accumulate_grad(merge_heads(d_q_heads, batch, seq, heads, head_dim));
             }
             if (k_v->requires_grad) {
-                k_v->accumulate_grad(matmul_fp32_acc(d_scores_scaled, *q_v->data, true, false));
+                auto d_k_heads = matmul_fp32_acc(d_scores_scaled, q_heads, true, false);
+                k_v->accumulate_grad(merge_heads(d_k_heads, batch, seq, heads, head_dim));
             }
         };
 
@@ -320,11 +372,16 @@ struct PersistentTransformerLayerLN {
         wk.out = ttnn::add(ttnn::matmul(ln1.out, wk.weight, false, true), wk.bias);
         wv.out = ttnn::add(ttnn::matmul(ln1.out, wv.weight, false, true), wv.bias);
 
-        attn_scores = ttnn::multiply(matmul_fp32_acc(wq.out, wk.out, false, true), scale);
+        q_heads = split_heads(wq.out, batch, seq, heads, head_dim);
+        k_heads = split_heads(wk.out, batch, seq, heads, head_dim);
+        v_heads = split_heads(wv.out, batch, seq, heads, head_dim);
+
+        attn_scores = ttnn::multiply(matmul_fp32_acc(q_heads, k_heads, false, true), scale);
         auto scores_masked = ttnn::add(attn_scores, causal_mask);
         attn_weights = ttnn::softmax(scores_masked, -1, std::nullopt, get_softmax_compute_config(), true);
 
-        attn_out = matmul_fp32_acc(attn_weights, wv.out);
+        attn_out_heads = matmul_fp32_acc(attn_weights, v_heads);
+        attn_out = merge_heads(attn_out_heads, batch, seq, heads, head_dim);
         wo.out = ttnn::add(ttnn::matmul(attn_out, wo.weight, false, true), wo.bias);
 
         residual1 = ttnn::add(x, wo.out);
@@ -385,8 +442,10 @@ struct PersistentTransformerLayerBFP8 {
     // Forward buffers
     Tensor q_proj, k_proj, v_proj;
     Tensor d_q_proj, d_k_proj, d_v_proj;
+    Tensor q_heads, k_heads, v_heads;
     Tensor attn_scores, d_attn_scores;
     Tensor attn_weights, d_attn_weights;
+    Tensor attn_out_heads;
     Tensor attn_out, d_attn_out;
     Tensor attn_proj, d_attn_proj;
     Tensor residual1, d_residual1;
@@ -403,7 +462,7 @@ struct PersistentTransformerLayerBFP8 {
           wv(b, s, d, d, init, dev),
           wo(b, s, d, d, init, dev),
           ffn(b, s, d, d * ffn_mult, init, dev),  // BFP8 FFN
-          scale(1.0f / std::sqrt(static_cast<float>(d / h))),
+          scale(attn_scale(d, h)),
           batch(b), seq(s), dim(d), heads(h), head_dim(d / h),
           q_proj(make_zeros(ttnn::Shape({b, s, d}), dev)),
           k_proj(make_zeros(ttnn::Shape({b, s, d}), dev)),
@@ -411,10 +470,14 @@ struct PersistentTransformerLayerBFP8 {
           d_q_proj(make_zeros(ttnn::Shape({b, s, d}), dev)),
           d_k_proj(make_zeros(ttnn::Shape({b, s, d}), dev)),
           d_v_proj(make_zeros(ttnn::Shape({b, s, d}), dev)),
-          attn_scores(make_zeros(ttnn::Shape({b, s, s}), dev)),
-          d_attn_scores(make_zeros(ttnn::Shape({b, s, s}), dev)),
-          attn_weights(make_zeros(ttnn::Shape({b, s, s}), dev)),
-          d_attn_weights(make_zeros(ttnn::Shape({b, s, s}), dev)),
+          q_heads(make_zeros(ttnn::Shape({b, h, s, head_dim}), dev)),
+          k_heads(make_zeros(ttnn::Shape({b, h, s, head_dim}), dev)),
+          v_heads(make_zeros(ttnn::Shape({b, h, s, head_dim}), dev)),
+          attn_scores(make_zeros(ttnn::Shape({b, h, s, s}), dev)),
+          d_attn_scores(make_zeros(ttnn::Shape({b, h, s, s}), dev)),
+          attn_weights(make_zeros(ttnn::Shape({b, h, s, s}), dev)),
+          d_attn_weights(make_zeros(ttnn::Shape({b, h, s, s}), dev)),
+          attn_out_heads(make_zeros(ttnn::Shape({b, h, s, head_dim}), dev)),
           attn_out(make_zeros(ttnn::Shape({b, s, d}), dev)),
           d_attn_out(make_zeros(ttnn::Shape({b, s, d}), dev)),
           attn_proj(make_zeros(ttnn::Shape({b, s, d}), dev)),
@@ -439,17 +502,16 @@ struct PersistentTransformerLayerBFP8 {
         auto* k_v = wk.forward(g, ln1_v);
         auto* v_v = wv.forward(g, ln1_v);
 
-        // Simplified attention: scores = Q @ K.T * scale
-        attn_scores = ttnn::multiply(ttnn::matmul(*q_v->data, *k_v->data, false, true), scale);
+        q_heads = split_heads(*q_v->data, batch, seq, heads, head_dim);
+        k_heads = split_heads(*k_v->data, batch, seq, heads, head_dim);
+        v_heads = split_heads(*v_v->data, batch, seq, heads, head_dim);
 
-        // Apply causal mask
+        attn_scores = ttnn::multiply(matmul_fp32_acc(q_heads, k_heads, false, true), scale);
         auto scores_masked = ttnn::add(attn_scores, causal_mask);
-
-        // Softmax
         attn_weights = ttnn::softmax(scores_masked, -1, std::nullopt, get_softmax_compute_config(), true);
 
-        // attn_out = attn_weights @ V
-        attn_out = ttnn::matmul(attn_weights, *v_v->data);
+        attn_out_heads = matmul_fp32_acc(attn_weights, v_heads);
+        attn_out = merge_heads(attn_out_heads, batch, seq, heads, head_dim);
 
         // Create node for attention output
         auto* attn_v = g.node(&attn_out, &d_attn_out);
@@ -460,9 +522,11 @@ struct PersistentTransformerLayerBFP8 {
             if (!attn_v->grad) return;
             const auto& dout = *attn_v->grad;
 
-            auto d_attn = ttnn::matmul(dout, *v_v->data, false, true);
+            auto d_out_heads = split_heads(dout, batch, seq, heads, head_dim);
+            auto d_attn = matmul_fp32_acc(d_out_heads, v_heads, false, true);
             if (v_v->requires_grad) {
-                v_v->accumulate_grad(ttnn::matmul(attn_weights, dout, true, false));
+                auto d_v_heads = matmul_fp32_acc(attn_weights, d_out_heads, true, false);
+                v_v->accumulate_grad(merge_heads(d_v_heads, batch, seq, heads, head_dim));
             }
 
             auto dy_y = ttnn::multiply(d_attn, attn_weights);
@@ -471,10 +535,12 @@ struct PersistentTransformerLayerBFP8 {
             auto d_scores_scaled = ttnn::multiply(d_scores, scale);
 
             if (q_v->requires_grad) {
-                q_v->accumulate_grad(ttnn::matmul(d_scores_scaled, *k_v->data));
+                auto d_q_heads = matmul_fp32_acc(d_scores_scaled, k_heads);
+                q_v->accumulate_grad(merge_heads(d_q_heads, batch, seq, heads, head_dim));
             }
             if (k_v->requires_grad) {
-                k_v->accumulate_grad(ttnn::matmul(d_scores_scaled, *q_v->data, true, false));
+                auto d_k_heads = matmul_fp32_acc(d_scores_scaled, q_heads, true, false);
+                k_v->accumulate_grad(merge_heads(d_k_heads, batch, seq, heads, head_dim));
             }
         };
 

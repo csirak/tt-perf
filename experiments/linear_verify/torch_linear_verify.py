@@ -182,6 +182,12 @@ def main():
             "ln_gamma.bin",
             "ln_beta.bin",
             "ln_out.bin",
+            "ln_mean.bin",
+            "ln_rstd.bin",
+            "ln_x_norm.bin",
+            "ln_x_centered.bin",
+            "ln_mean_broadcast.bin",
+            "ln_rstd_broadcast.bin",
             "ln_gamma_grad.bin",
             "ln_beta_grad.bin",
             "ln_out_grad.bin",
@@ -222,6 +228,83 @@ def main():
             print_comparison(result)
         else:
             print("  ln_out_from_cpp_linear   : SHAPE MISMATCH")
+
+    if stage == 1:
+        # Compare LN stats computed in PyTorch vs TTNN manual LN buffers
+        cpp_mean_path = cpp_dir / "ln_mean.bin"
+        cpp_rstd_path = cpp_dir / "ln_rstd.bin"
+        cpp_xnorm_path = cpp_dir / "ln_x_norm.bin"
+        if cpp_mean_path.exists():
+            cpp_mean = load_tensor(str(cpp_mean_path))
+            torch_mean = linear_out.float().mean(dim=-1, keepdim=True).to(dtype)
+            if cpp_mean.shape == torch_mean.shape:
+                result = compare_tensors("ln_mean", torch_mean, cpp_mean)
+                print_comparison(result)
+            else:
+                print("  ln_mean                  : SHAPE MISMATCH")
+        if cpp_rstd_path.exists():
+            cpp_rstd = load_tensor(str(cpp_rstd_path))
+            var = (linear_out.float() - linear_out.float().mean(dim=-1, keepdim=True)) ** 2
+            var = var.mean(dim=-1, keepdim=True)
+            torch_rstd = (var + eps).rsqrt().to(dtype)
+            if cpp_rstd.shape == torch_rstd.shape:
+                result = compare_tensors("ln_rstd", torch_rstd, cpp_rstd)
+                print_comparison(result)
+            else:
+                print("  ln_rstd                  : SHAPE MISMATCH")
+        if cpp_xnorm_path.exists():
+            cpp_xnorm = load_tensor(str(cpp_xnorm_path))
+            mean = linear_out.float().mean(dim=-1, keepdim=True)
+            var = ((linear_out.float() - mean) ** 2).mean(dim=-1, keepdim=True)
+            torch_xnorm = ((linear_out.float() - mean) * (var + eps).rsqrt()).to(dtype)
+            if cpp_xnorm.shape == torch_xnorm.shape:
+                result = compare_tensors("ln_x_norm", torch_xnorm, cpp_xnorm)
+                print_comparison(result)
+            else:
+                print("  ln_x_norm                : SHAPE MISMATCH")
+
+        # Compare x_norm using C++ mean/rstd buffers (isolates mean/rstd vs multiply)
+        if cpp_xnorm_path.exists() and cpp_mean_path.exists() and cpp_rstd_path.exists():
+            cpp_xnorm = load_tensor(str(cpp_xnorm_path))
+            cpp_mean = load_tensor(str(cpp_mean_path)).to(dtype)
+            cpp_rstd = load_tensor(str(cpp_rstd_path)).to(dtype)
+            torch_xnorm_cppstats = (linear_out.to(dtype) - cpp_mean) * cpp_rstd
+            if cpp_xnorm.shape == torch_xnorm_cppstats.shape:
+                result = compare_tensors("ln_x_norm_cppstats", torch_xnorm_cppstats, cpp_xnorm)
+                print_comparison(result)
+            else:
+                print("  ln_x_norm_cppstats       : SHAPE MISMATCH")
+        cpp_xc_path = cpp_dir / "ln_x_centered.bin"
+        if cpp_xc_path.exists():
+            cpp_xc = load_tensor(str(cpp_xc_path))
+            torch_xc = (linear_out.float() - linear_out.float().mean(dim=-1, keepdim=True)).to(dtype)
+            if cpp_xc.shape == torch_xc.shape:
+                result = compare_tensors("ln_x_centered", torch_xc, cpp_xc)
+                print_comparison(result)
+            else:
+                print("  ln_x_centered            : SHAPE MISMATCH")
+        cpp_mean_b_path = cpp_dir / "ln_mean_broadcast.bin"
+        if cpp_mean_b_path.exists():
+            cpp_mean_b = load_tensor(str(cpp_mean_b_path))
+            torch_mean = linear_out.float().mean(dim=-1, keepdim=True)
+            torch_mean_b = torch_mean.repeat(1, 1, out_dim).to(dtype)
+            if cpp_mean_b.shape == torch_mean_b.shape:
+                result = compare_tensors("ln_mean_broadcast", torch_mean_b, cpp_mean_b)
+                print_comparison(result)
+            else:
+                print("  ln_mean_broadcast        : SHAPE MISMATCH")
+        cpp_rstd_b_path = cpp_dir / "ln_rstd_broadcast.bin"
+        if cpp_rstd_b_path.exists():
+            cpp_rstd_b = load_tensor(str(cpp_rstd_b_path))
+            mean = linear_out.float().mean(dim=-1, keepdim=True)
+            var = ((linear_out.float() - mean) ** 2).mean(dim=-1, keepdim=True)
+            torch_rstd = (var + eps).rsqrt()
+            torch_rstd_b = torch_rstd.repeat(1, 1, out_dim).to(dtype)
+            if cpp_rstd_b.shape == torch_rstd_b.shape:
+                result = compare_tensors("ln_rstd_broadcast", torch_rstd_b, cpp_rstd_b)
+                print_comparison(result)
+            else:
+                print("  ln_rstd_broadcast        : SHAPE MISMATCH")
 
     if stage == 1 and ln_out_from_cpp_bf16 is not None:
         cpp_ln = load_tensor(str(cpp_dir / "ln_out.bin"))

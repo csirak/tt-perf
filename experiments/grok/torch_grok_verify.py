@@ -44,7 +44,7 @@ def ffn(x, w1, b1, w2, b2, dtype, approx: str = "tanh"):
 
 
 def causal_mask(seq, dtype):
-    return torch.triu(torch.full((1, seq, seq), -1e9, dtype=dtype), diagonal=1)
+    return torch.triu(torch.full((1, 1, seq, seq), -1e9, dtype=dtype), diagonal=1)
 
 
 def save(name, tensor, out_dir):
@@ -81,7 +81,8 @@ def main():
     ln_eps = float(meta.get("ln_eps", 1e-5))
 
     dtype = torch.bfloat16
-    scale = 1.0 / (dim // heads) ** 0.5
+    head_dim = dim // heads
+    scale = 1.0 / head_dim ** 0.5
 
     tokens = load_tensor(str(cpp_dir / "tokens.bin")).to(dtype=torch.int64)
     tokens = tokens.view(batch, seq)
@@ -105,6 +106,16 @@ def main():
         "tok_weight": tok_weight,
         "pos_weight": pos_weight,
     }
+    ln_final_gamma = None
+    ln_final_beta = None
+    if use_layer_norm:
+        ln_final_gamma = load_tensor(str(cpp_dir / "ln_final_gamma.bin")).to(dtype).requires_grad_()
+        ln_final_beta = load_tensor(str(cpp_dir / "ln_final_beta.bin")).to(dtype).requires_grad_()
+        params.extend([ln_final_gamma, ln_final_beta])
+        param_tensors.update({
+            "ln_final_gamma": ln_final_gamma,
+            "ln_final_beta": ln_final_beta,
+        })
 
     for layer in range(layers):
         prefix = f"layer{layer}"
@@ -206,7 +217,11 @@ def main():
         save(f"{prefix}_wk.bin", k, out_dir)
         save(f"{prefix}_wv.bin", v, out_dir)
 
-        scores = (torch.matmul(q, k.transpose(-1, -2)) * scale).to(dtype)
+        qh = q.view(batch, seq, heads, head_dim).transpose(1, 2)
+        kh = k.view(batch, seq, heads, head_dim).transpose(1, 2)
+        vh = v.view(batch, seq, heads, head_dim).transpose(1, 2)
+
+        scores = (torch.matmul(qh, kh.transpose(-1, -2)) * scale).to(dtype)
         save(f"{prefix}_attn_scores.bin", scores, out_dir)
         scores_masked = (scores + mask).to(dtype)
         scores_max = scores_masked.max(dim=-1, keepdim=True).values.to(dtype)
@@ -214,7 +229,8 @@ def main():
         attn_weights = torch.softmax(scores_centered, dim=-1).to(dtype)
         save(f"{prefix}_attn_weights.bin", attn_weights, out_dir)
 
-        attn_out = torch.matmul(attn_weights, v).to(dtype)
+        attn_out_heads = torch.matmul(attn_weights, vh).to(dtype)
+        attn_out = attn_out_heads.transpose(1, 2).contiguous().view(batch, seq, dim)
         save(f"{prefix}_attn_out.bin", attn_out, out_dir)
 
         wo_out = linear3d(attn_out, wo_w, wo_b, dtype)
@@ -240,6 +256,10 @@ def main():
 
         h = (residual1 + ffn_out).to(dtype)
         save(f"{prefix}_output.bin", h, out_dir)
+
+    if use_layer_norm:
+        h = layer_norm(h, ln_final_gamma, ln_final_beta, ln_eps, dtype)
+        save("ln_final.bin", h, out_dir)
 
     out_w = load_tensor(str(cpp_dir / "output_weight.bin")).to(dtype).requires_grad_()
     out_b = load_tensor(str(cpp_dir / "output_bias.bin")).to(dtype).requires_grad_()
@@ -294,6 +314,8 @@ def main():
             f"{prefix}_ffn_w2.bin",
             f"{prefix}_output.bin",
         ])
+    if use_layer_norm:
+        compare_files.append("ln_final.bin")
     compare_files.extend(["logits.bin", "loss.bin"])
 
     results = []

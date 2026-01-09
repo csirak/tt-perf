@@ -1,0 +1,8 @@
+# GELU backward verify config
+
+batch: 32
+seq: 32
+dim: 128
+seed: 1
+
+dump_dir: /home/howard/ttnn-perf/experiments/grok/outputs/gelu_bw

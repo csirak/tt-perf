@@ -1,0 +1,5 @@
+batch: 256
+seq: 32
+seed: 1
+dump_outputs: 1
+dump_dir: /home/howard/ttnn-perf/experiments/grok/outputs/softmax_bw

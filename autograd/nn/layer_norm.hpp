@@ -1,9 +1,8 @@
 #pragma once
 
 #include "common.hpp"
+#include <ttnn/operations/data_movement/repeat/repeat.hpp>
 #include <ttnn/operations/normalization/layernorm/layernorm.hpp>
-#include <ttnn/operations/moreh/moreh_layer_norm/moreh_layer_norm.hpp>
-#include <ttnn/operations/moreh/moreh_layer_norm_backward/moreh_layer_norm_backward.hpp>
 
 namespace static_autograd {
 
@@ -22,26 +21,32 @@ struct LayerNorm {
     Tensor out;
     Tensor d_out;
     Tensor x_norm;      // unused (kept for compatibility)
+    Tensor x_centered;  // cached x - mean for debug/backward
     Tensor mean;        // cached mean for backward
     Tensor rstd;        // cached 1/sqrt(var+eps) for backward
     Tensor d_input;     // temp buffer for input grad
 
+    uint32_t batch;
+    uint32_t seq;
     uint32_t dim;
     float eps;
 
-    LayerNorm(uint32_t batch, uint32_t seq, uint32_t d, float epsilon, MeshDevice& dev)
+    LayerNorm(uint32_t batch_, uint32_t seq_, uint32_t d, float epsilon, MeshDevice& dev)
         : gamma(make_full(ttnn::Shape({1, 1, d}), 1.0f, dev)),
           beta(make_zeros(ttnn::Shape({1, 1, d}), dev)),
           d_gamma(make_zeros(ttnn::Shape({1, 1, d}), dev)),
           d_beta(make_zeros(ttnn::Shape({1, 1, d}), dev)),
           v_gamma(make_zeros(ttnn::Shape({1, 1, d}), dev)),
           v_beta(make_zeros(ttnn::Shape({1, 1, d}), dev)),
-          out(make_zeros(ttnn::Shape({batch, seq, d}), dev)),
-          d_out(make_zeros(ttnn::Shape({batch, seq, d}), dev)),
-          x_norm(make_zeros(ttnn::Shape({batch, seq, d}), dev)),
-          mean(make_zeros(ttnn::Shape({batch, seq, 1}), dev)),
-          rstd(make_zeros(ttnn::Shape({batch, seq, 1}), dev)),
-          d_input(make_zeros(ttnn::Shape({batch, seq, d}), dev)),
+          out(make_zeros(ttnn::Shape({batch_, seq_, d}), dev)),
+          d_out(make_zeros(ttnn::Shape({batch_, seq_, d}), dev)),
+          x_norm(make_zeros(ttnn::Shape({batch_, seq_, d}), dev)),
+          x_centered(make_zeros(ttnn::Shape({batch_, seq_, d}), dev)),
+          mean(make_zeros(ttnn::Shape({batch_, seq_, 1}), dev)),
+          rstd(make_zeros(ttnn::Shape({batch_, seq_, 1}), dev)),
+          d_input(make_zeros(ttnn::Shape({batch_, seq_, d}), dev)),
+          batch(batch_),
+          seq(seq_),
           dim(d),
           eps(epsilon) {}
 
@@ -52,25 +57,20 @@ struct LayerNorm {
         auto* gam = g.leaf(&gamma, &d_gamma, true);
         auto* bet = g.leaf(&beta, &d_beta, true);
 
+        // Forward uses built-in layer_norm for correctness; stats for backward still computed manually.
         auto compute_cfg = get_fp32_acc_compute_config();
-        out = ttnn::layer_norm(*x->data, eps, gamma, beta,
-                               std::nullopt, std::nullopt, std::nullopt,
-                               compute_cfg);
+        out = ttnn::layer_norm(*x->data, eps, gamma, beta, std::nullopt, std::nullopt, std::nullopt, compute_cfg);
 
-        // Recompute mean/rstd for backward using moreh (for now)
-        auto stats = ttnn::moreh_layer_norm(
-            *x->data,
-            /* normalized_dims */ 1,
-            eps,
-            gamma,
-            beta,
-            x_norm,
-            mean,
-            rstd,
-            std::nullopt,
-            compute_cfg);
-        mean = stats[1].value();
-        rstd = stats[2].value();
+        // TTNN mean does not guarantee negative dim support; use explicit last-dim index (2).
+        mean = ttnn::mean(*x->data, 2, true, std::nullopt, compute_cfg);
+        auto mean_broadcast = ttnn::repeat(mean, ttnn::Shape({1, 1, dim}));
+        x_centered = ttnn::subtract(*x->data, mean_broadcast);
+        auto var = ttnn::mean(ttnn::multiply(x_centered, x_centered), 2, true, std::nullopt, compute_cfg);
+        rstd = ttnn::rsqrt(ttnn::add(var, eps), false);
+
+        auto beta_broadcast = ttnn::repeat(beta, ttnn::Shape({batch, seq, 1}));
+        auto gamma_broadcast = ttnn::repeat(gamma, ttnn::Shape({batch, seq, 1}));
+        x_norm = ttnn::divide(ttnn::subtract(out, beta_broadcast), gamma_broadcast);
 
         auto* v = g.node(&out, &d_out);
         v->parents = {x, gam, bet};
@@ -79,27 +79,34 @@ struct LayerNorm {
             if (!v->grad) return;
             const auto& dout = *v->grad;
 
-            auto res = ttnn::moreh_layer_norm_backward(
-                dout,
-                *x->data,
-                mean,
-                rstd,
-                /* normalized_dims */ 1,
-                gamma,
-                d_input,
-                d_gamma,
-                d_beta,
-                std::nullopt,
-                get_fp32_acc_compute_config());
-
-            if (x->requires_grad) {
-                x->accumulate_grad(res[0].value());
-            }
-            if (gam->requires_grad) {
-                gam->accumulate_grad(res[1].value());
-            }
+            // d_beta = sum(dout, dims=[0,1])
             if (bet->requires_grad) {
-                bet->accumulate_grad(res[2].value());
+                auto sum0 = ttnn::sum(dout, 0, true);
+                bet->accumulate_grad(ttnn::sum(sum0, 1, true));
+            }
+
+            // d_gamma = sum(dout * x_norm, dims=[0,1])
+            if (gam->requires_grad) {
+                auto d_out_x_norm = ttnn::multiply(dout, x_norm);
+                auto sum0_g = ttnn::sum(d_out_x_norm, 0, true);
+                gam->accumulate_grad(ttnn::sum(sum0_g, 1, true));
+            }
+
+            // d_x = rstd * (d_x_norm - mean(d_x_norm) - x_norm * mean(d_x_norm * x_norm))
+            if (x->requires_grad) {
+                auto d_x_norm = ttnn::multiply(dout, gamma);
+                auto mean_d_x_norm = ttnn::mean(d_x_norm, 2, true, std::nullopt,
+                                                 get_fp32_acc_compute_config());
+                auto mean_d_x_norm_broadcast = ttnn::repeat(mean_d_x_norm, ttnn::Shape({1, 1, dim}));
+                auto d_x_norm_x_norm = ttnn::multiply(d_x_norm, x_norm);
+                auto mean_d_x_norm_x_norm = ttnn::mean(d_x_norm_x_norm, 2, true, std::nullopt,
+                                                       get_fp32_acc_compute_config());
+                auto mean_d_x_norm_x_norm_broadcast = ttnn::repeat(mean_d_x_norm_x_norm, ttnn::Shape({1, 1, dim}));
+                auto diff1 = ttnn::subtract(d_x_norm, mean_d_x_norm_broadcast);
+                auto term2 = ttnn::multiply(x_norm, mean_d_x_norm_x_norm_broadcast);
+                auto diff2 = ttnn::subtract(diff1, term2);
+                auto rstd_broadcast = ttnn::repeat(rstd, ttnn::Shape({1, 1, dim}));
+                x->accumulate_grad(ttnn::multiply(rstd_broadcast, diff2));
             }
         };
 
@@ -108,22 +115,17 @@ struct LayerNorm {
 
     Tensor* execute_forward(const Tensor& x) {
         auto compute_cfg = get_fp32_acc_compute_config();
-        out = ttnn::layer_norm(x, eps, gamma, beta,
-                               std::nullopt, std::nullopt, std::nullopt,
-                               compute_cfg);
-        auto stats = ttnn::moreh_layer_norm(
-            x,
-            /* normalized_dims */ 1,
-            eps,
-            gamma,
-            beta,
-            x_norm,
-            mean,
-            rstd,
-            std::nullopt,
-            compute_cfg);
-        mean = stats[1].value();
-        rstd = stats[2].value();
+        out = ttnn::layer_norm(x, eps, gamma, beta, std::nullopt, std::nullopt, std::nullopt, compute_cfg);
+
+        mean = ttnn::mean(x, 2, true, std::nullopt, compute_cfg);
+        auto mean_broadcast = ttnn::repeat(mean, ttnn::Shape({1, 1, dim}));
+        x_centered = ttnn::subtract(x, mean_broadcast);
+        auto var = ttnn::mean(ttnn::multiply(x_centered, x_centered), 2, true, std::nullopt, compute_cfg);
+        rstd = ttnn::rsqrt(ttnn::add(var, eps), false);
+
+        auto beta_broadcast = ttnn::repeat(beta, ttnn::Shape({batch, seq, 1}));
+        auto gamma_broadcast = ttnn::repeat(gamma, ttnn::Shape({batch, seq, 1}));
+        x_norm = ttnn::divide(ttnn::subtract(out, beta_broadcast), gamma_broadcast);
         return &out;
     }
 
@@ -191,16 +193,18 @@ struct LayerNormBFP8 {
 
         // All intermediate computations in BF16 for numerical stability
         // mean = mean(x, dim=-1, keepdim=True)
-        auto mean_val = ttnn::mean(*x->data, -1, true, std::nullopt, get_fp32_acc_compute_config());
+        auto mean_val = ttnn::mean(*x->data, 2, true, std::nullopt, get_fp32_acc_compute_config());
         // x_centered = x - mean
-        auto x_centered = ttnn::subtract(*x->data, mean_val);
+        auto mean_broadcast = ttnn::repeat(mean_val, ttnn::Shape({1, 1, dim}));
+        auto x_centered = ttnn::subtract(*x->data, mean_broadcast);
         // var = mean(x_centered^2)
-        auto var = ttnn::mean(ttnn::multiply(x_centered, x_centered), -1, true, std::nullopt,
+        auto var = ttnn::mean(ttnn::multiply(x_centered, x_centered), 2, true, std::nullopt,
                               get_fp32_acc_compute_config());
         // rstd = 1/sqrt(var + eps)
         rstd = ttnn::rsqrt(ttnn::add(var, eps), false);
+        auto rstd_broadcast = ttnn::repeat(rstd, ttnn::Shape({1, 1, dim}));
         // x_norm = x_centered * rstd
-        x_norm = ttnn::multiply(x_centered, rstd);
+        x_norm = ttnn::multiply(x_centered, rstd_broadcast);
         // scaled = gamma * x_norm
         auto scaled = ttnn::multiply(gamma, x_norm);
         // out = scaled + beta, with output cast to BFP8 using preallocated buffer
@@ -250,15 +254,18 @@ struct LayerNormBFP8 {
                 ZoneScopedN("ln_d_x");
 #endif
                 auto d_x_norm = ttnn::multiply(dout, gamma);
-                auto mean_d_x_norm = ttnn::mean(d_x_norm, -1, true, std::nullopt,
+                auto mean_d_x_norm = ttnn::mean(d_x_norm, 2, true, std::nullopt,
                                                  get_fp32_acc_compute_config());
+                auto mean_d_x_norm_broadcast = ttnn::repeat(mean_d_x_norm, ttnn::Shape({1, 1, dim}));
                 auto d_x_norm_x_norm = ttnn::multiply(d_x_norm, x_norm);
-                auto mean_d_x_norm_x_norm = ttnn::mean(d_x_norm_x_norm, -1, true, std::nullopt,
+                auto mean_d_x_norm_x_norm = ttnn::mean(d_x_norm_x_norm, 2, true, std::nullopt,
                                                        get_fp32_acc_compute_config());
-                auto diff1 = ttnn::subtract(d_x_norm, mean_d_x_norm);
-                auto term2 = ttnn::multiply(x_norm, mean_d_x_norm_x_norm);
+                auto mean_d_x_norm_x_norm_broadcast = ttnn::repeat(mean_d_x_norm_x_norm, ttnn::Shape({1, 1, dim}));
+                auto diff1 = ttnn::subtract(d_x_norm, mean_d_x_norm_broadcast);
+                auto term2 = ttnn::multiply(x_norm, mean_d_x_norm_x_norm_broadcast);
                 auto diff2 = ttnn::subtract(diff1, term2);
-                x->accumulate_grad(ttnn::multiply(rstd, diff2));
+                auto rstd_broadcast = ttnn::repeat(rstd, ttnn::Shape({1, 1, dim}));
+                x->accumulate_grad(ttnn::multiply(rstd_broadcast, diff2));
             }
         };
 

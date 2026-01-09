@@ -1,0 +1,26 @@
+# Grok training config with Adam (p=127, train_frac=0.5) extended steps
+p: 127
+train_frac: 0.5
+pad_to: 32
+batch_size: 256
+steps: 80000
+log_every: 2000
+eval_every: 2000
+seed: 0
+
+optimizer: adam
+lr: 0.001
+beta1: 0.9
+beta2: 0.999
+eps: 1e-6
+weight_decay: 0.01
+
+dim: 128
+heads: 4
+ffn_mult: 4
+layers: 2
+use_layer_norm: 1
+ln_eps: 1e-5
+loss_scale: 1.0
+
+csv: /home/howard/ttnn-perf/experiments/grok/adam_tf05_80k_results.csv

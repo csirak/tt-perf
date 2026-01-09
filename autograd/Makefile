@@ -1378,6 +1378,86 @@ linear-verify-build:
 linear-verify-run:
 	cd $(TT_METAL) && ./build_Release/ttnn/examples/example_autograd
 
+# === Softmax Backward Verify (BF16) ===
+# Usage: SOFTMAX_BW_CONFIG=~/ttnn-perf/experiments/grok/softmax_bw_verify.yaml make softmax-bw-verify
+
+softmax-bw-verify: softmax-bw-verify-sync softmax-bw-verify-build softmax-bw-verify-run
+
+softmax-bw-verify-sync:
+	mkdir -p $(AUTOGRAD_DIR)/autograd
+	mkdir -p $(AUTOGRAD_DIR)/utils
+	cp -r nn $(AUTOGRAD_DIR)/autograd/
+	cp -r utils $(AUTOGRAD_DIR)/autograd/
+	cp ops.hpp tensor_group.hpp value.hpp nn.hpp $(AUTOGRAD_DIR)/autograd/
+	cp common.hpp $(AUTOGRAD_DIR)/
+	cp ../experiments/grok/softmax_bw_verify.cpp $(AUTOGRAD_DIR)/main.cpp
+
+softmax-bw-verify-build:
+	cd $(BUILD_DIR) && ninja example_autograd
+
+softmax-bw-verify-run:
+	cd $(TT_METAL) && ./build_Release/ttnn/examples/example_autograd
+
+# === Embedding Backward Verify (BF16) ===
+# Usage: EMBEDDING_BW_CONFIG=~/ttnn-perf/experiments/grok/embedding_bw_verify.yaml make embedding-bw-verify
+
+embedding-bw-verify: embedding-bw-verify-sync embedding-bw-verify-build embedding-bw-verify-run
+
+embedding-bw-verify-sync:
+	mkdir -p $(AUTOGRAD_DIR)/autograd
+	mkdir -p $(AUTOGRAD_DIR)/utils
+	cp -r nn $(AUTOGRAD_DIR)/autograd/
+	cp -r utils $(AUTOGRAD_DIR)/autograd/
+	cp ops.hpp tensor_group.hpp value.hpp nn.hpp $(AUTOGRAD_DIR)/autograd/
+	cp common.hpp $(AUTOGRAD_DIR)/
+	cp ../experiments/grok/embedding_bw_verify.cpp $(AUTOGRAD_DIR)/main.cpp
+
+embedding-bw-verify-build:
+	cd $(BUILD_DIR) && ninja example_autograd
+
+embedding-bw-verify-run:
+	cd $(TT_METAL) && ./build_Release/ttnn/examples/example_autograd
+
+# === Attention Backward Verify (BF16) ===
+# Usage: ATTN_BW_CONFIG=~/ttnn-perf/experiments/grok/attn_bw_verify.yaml make attn-bw-verify
+
+attn-bw-verify: attn-bw-verify-sync attn-bw-verify-build attn-bw-verify-run
+
+attn-bw-verify-sync:
+	mkdir -p $(AUTOGRAD_DIR)/autograd
+	mkdir -p $(AUTOGRAD_DIR)/utils
+	cp -r nn $(AUTOGRAD_DIR)/autograd/
+	cp -r utils $(AUTOGRAD_DIR)/autograd/
+	cp ops.hpp tensor_group.hpp value.hpp nn.hpp $(AUTOGRAD_DIR)/autograd/
+	cp common.hpp $(AUTOGRAD_DIR)/
+	cp ../experiments/grok/attn_bw_verify.cpp $(AUTOGRAD_DIR)/main.cpp
+
+attn-bw-verify-build:
+	cd $(BUILD_DIR) && ninja example_autograd
+
+attn-bw-verify-run:
+	cd $(TT_METAL) && ./build_Release/ttnn/examples/example_autograd
+
+# === GELU Backward Verify (BF16) ===
+# Usage: GELU_BW_CONFIG=~/ttnn-perf/experiments/grok/gelu_bw_verify.yaml make gelu-bw-verify
+
+gelu-bw-verify: gelu-bw-verify-sync gelu-bw-verify-build gelu-bw-verify-run
+
+gelu-bw-verify-sync:
+	mkdir -p $(AUTOGRAD_DIR)/autograd
+	mkdir -p $(AUTOGRAD_DIR)/utils
+	cp -r nn $(AUTOGRAD_DIR)/autograd/
+	cp -r utils $(AUTOGRAD_DIR)/autograd/
+	cp ops.hpp tensor_group.hpp value.hpp nn.hpp $(AUTOGRAD_DIR)/autograd/
+	cp common.hpp $(AUTOGRAD_DIR)/
+	cp ../experiments/grok/gelu_bw_verify.cpp $(AUTOGRAD_DIR)/main.cpp
+
+gelu-bw-verify-build:
+	cd $(BUILD_DIR) && ninja example_autograd
+
+gelu-bw-verify-run:
+	cd $(TT_METAL) && ./build_Release/ttnn/examples/example_autograd
+
 # === MNIST MLP Parity (AdamW) ===
 # Usage: MNIST_CONFIG=~/ttnn-perf/experiments/mnist/default.yaml make mnist-train
 

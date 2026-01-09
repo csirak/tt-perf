@@ -1,0 +1,31 @@
+# Grok debug config (Adam) with dumps for update verification
+p: 127
+train_frac: 0.8
+pad_to: 32
+batch_size: 256
+steps: 1
+log_every: 1
+eval_every: 0
+seed: 0
+
+optimizer: adam
+lr: 0.001
+beta1: 0.9
+beta2: 0.999
+eps: 1e-6
+weight_decay: 0.01
+
+dim: 128
+heads: 4
+ffn_mult: 4
+layers: 2
+use_layer_norm: 1
+ln_eps: 1e-5
+loss_scale: 1.0
+
+dump_outputs: 1
+dump_dir: /home/howard/ttnn-perf/experiments/grok/outputs/adam_debug_dump
+dump_steps: 1
+dump_steps_dir: /home/howard/ttnn-perf/experiments/grok/outputs/adam_debug_dump_steps
+
+csv: /home/howard/ttnn-perf/experiments/grok/adam_debug_dump_results.csv

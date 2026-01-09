@@ -203,6 +203,14 @@ int main() {
             traced::save_tensor(ln.gamma, (std::filesystem::path(cfg.dump_dir) / "ln_gamma.bin").string(), &device);
             traced::save_tensor(ln.beta, (std::filesystem::path(cfg.dump_dir) / "ln_beta.bin").string(), &device);
             traced::save_tensor(ln.out, (std::filesystem::path(cfg.dump_dir) / "ln_out.bin").string(), &device);
+            traced::save_tensor(ln.mean, (std::filesystem::path(cfg.dump_dir) / "ln_mean.bin").string(), &device);
+            traced::save_tensor(ln.rstd, (std::filesystem::path(cfg.dump_dir) / "ln_rstd.bin").string(), &device);
+            traced::save_tensor(ln.x_norm, (std::filesystem::path(cfg.dump_dir) / "ln_x_norm.bin").string(), &device);
+            traced::save_tensor(ln.x_centered, (std::filesystem::path(cfg.dump_dir) / "ln_x_centered.bin").string(), &device);
+            auto mean_broadcast = ttnn::repeat(ln.mean, ttnn::Shape({1, 1, cfg.out_dim}));
+            traced::save_tensor(mean_broadcast, (std::filesystem::path(cfg.dump_dir) / "ln_mean_broadcast.bin").string(), &device);
+            auto rstd_broadcast = ttnn::repeat(ln.rstd, ttnn::Shape({1, 1, cfg.out_dim}));
+            traced::save_tensor(rstd_broadcast, (std::filesystem::path(cfg.dump_dir) / "ln_rstd_broadcast.bin").string(), &device);
             traced::save_tensor(ln_builtin, (std::filesystem::path(cfg.dump_dir) / "ln_out_builtin.bin").string(), &device);
         } else if (cfg.stage == 2) {
             traced::save_tensor(dyt->alpha, (std::filesystem::path(cfg.dump_dir) / "dyt_alpha.bin").string(), &device);

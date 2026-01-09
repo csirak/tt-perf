@@ -1,6 +1,43 @@
 # Wormhole ISA / TT-Metal Deep Research Prompt — Training Failure (Generated 2026-01-09 12:47)
 ## Objective
 We need a **deep research analysis** of TT‑Metal / TTNN / Wormhole ISA behavior to explain **why training does not converge** in TTNN while **PyTorch converges** under identical model + hyperparameters. The agent should inspect TT‑Metal source and Wormhole ISA docs and provide a prioritized list of root causes with evidence and validation experiments.
+## No‑Exec Constraint (Read‑Only Analysis)
+This agent **cannot run code**. All conclusions must come from:
+1) Static code inspection in this repo, and  
+2) The pre‑generated logs/artifacts committed below.  
+When proposing experiments, describe them clearly but **do not execute**.
+
+## Static Analysis Map (what to read)
+**Core TTNN autograd ops**
+- `autograd/ops.hpp` — GELU/softmax/matmul/add/sub/mul/backward definitions + softmax compute config.
+- `autograd/value.hpp` — gradient accumulation semantics (overwrites vs adds).
+
+**Compute configs & helpers**
+- `autograd/nn/common.hpp` — `get_fp32_acc_compute_config()` + `matmul_fp32_acc`.
+
+**Model components**
+- `autograd/nn/attention.hpp` — QKV, masking, softmax, attention backward.
+- `autograd/nn/layer_norm.hpp` — built‑in LN + manual stats + backward.
+- `autograd/nn/linear.hpp` — Linear3D, BFP8 linears, FP32‑acc toggles.
+- `autograd/nn/embedding.hpp` — embedding forward/backward.
+- `autograd/nn/loss.hpp` — LastTokenCrossEntropy + MSE.
+- `autograd/nn/adam.hpp` — AdamW update with fp32 master weights.
+
+**Training & parity harnesses**
+- `experiments/grok/train_grok.cpp` — TTNN training driver.
+- `experiments/grok/torch_grok_train.py` — PyTorch training mirror.
+- `experiments/grok/torch_grok_verify.py` — parity checks.
+- `experiments/grok/compare_loss_steps.py` — loss/grad compare TSV.
+- `experiments/grok/compare_attention.py` — attention compare.
+- `experiments/grok/attn_bw_verify.cpp/.py` — attention backward isolate.
+- `experiments/grok/gelu_bw_verify.cpp/.py` — GELU backward isolate.
+- `experiments/grok/softmax_bw_verify.cpp/.py` — softmax backward isolate.
+- `experiments/grok/embedding_bw_verify.cpp/.py` — embedding backward isolate.
+
+## Env Toggles (verified in code)
+- `GELU_APPROX` in `autograd/ops.hpp` (`none` or `tanh`) controls `gelu` + `gelu_bw`.
+- `LINEAR_FP32_ACC` in `autograd/nn/linear.hpp` enables `matmul_fp32_acc`.
+- `ATTN_SCALE_FULL_DIM` in `autograd/nn/attention.hpp` toggles scaling by `dim` vs `dim/heads`.
 ## Required Agent Tasks
 1. Inspect TT‑Metal / TTNN ops and kernels (matmul, softmax, gelu, layer_norm, reductions, optimizer updates).
 2. Investigate Wormhole ISA / microcode details that affect BF16 math, accumulation, rounding, or non‑determinism.
@@ -48,8 +85,8 @@ loss_scale: 1.0
 csv: /home/howard/ttnn-perf/experiments/grok/p_sweep/p127_1k.tsv
 ```
 
-## Log Files Index (generated at runtime; not committed to GitHub)
-**TTNN logs on howard (repo-relative paths):**
+## Log Files Index (committed to GitHub; repo-relative paths)
+**TTNN logs (Wormhole runs):**
 - `experiments/grok/p_sweep/*.tsv` (train/val loss + timing per p)
 - `experiments/grok/p_sweep_hparam/*.tsv` (hparam sweep logs)
 - `experiments/grok/p_sweep_torch/p31_1k.tsv` (torch baseline run logged on howard)
@@ -60,12 +97,15 @@ csv: /home/howard/ttnn-perf/experiments/grok/p_sweep/p127_1k.tsv
 - `experiments/grok/outputs/steps/loss_cpp.tsv` (TTNN loss logs)
 - `experiments/grok/outputs/steps/grad_norm_cpp.tsv` (TTNN grad norms)
 
-**Torch GPU logs on adam (not in this repo):**
-- `/home/adam/ttnn-perf/experiments/grok/p_sweep_torch/*.tsv`
-
-**Local copies (via sshfs on the Mac):**
-- `/Users/calebsirak/ttnn-perf-local/remote/experiments/grok/p_sweep/*.tsv`
-- `/Users/calebsirak/ttnn-perf-local/experiments/grok/p_sweep_torch/*.tsv`
+## Log Formats (headers as committed)
+- `experiments/grok/p_sweep/*.tsv`:  
+  `step	train_loss	val_loss	interval_s	total_s	avg_step_s`
+- `experiments/grok/outputs/steps/loss_compare.tsv`:  
+  `step	loss_cpp	loss_torch	abs_diff	rel_diff	grad_norm_cpp	grad_norm_torch_bf16	grad_norm_abs_diff	grad_norm_rel_diff	grad_norm_torch_fp32	grad_norm_fp32_abs_diff	grad_norm_fp32_rel_diff`
+- `experiments/grok/outputs/steps/act_norms_compare.tsv`:  
+  `step	metric	cpp_l2	torch_l2	abs_diff_l2	rel_diff_l2	cpp_l1	torch_l1	abs_diff_l1	rel_diff_l1`
+- `experiments/grok/outputs/steps/act_norms_summary.tsv`:  
+  `metric	max_rel_l2	step_max_rel_l2	max_rel_l1	step_max_rel_l1`
 
 ## Evidence: TTNN p‑Sweep (train_frac=0.8, 1k steps, AdamW)
 Summary table (train/val @ step 100 and 1000):

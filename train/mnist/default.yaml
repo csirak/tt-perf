@@ -1,0 +1,27 @@
+# MNIST MLP parity config (TTNN C++ + PyTorch functional)
+
+data_dir: /home/howard/ttnn-perf/train/mnist/data
+outputs_dir: /home/howard/ttnn-perf/train/mnist/outputs
+
+# Dataset
+train_samples: 256
+seed: 1
+pad_to: 1024      # 28*28 -> pad to 1024 (multiple of 32)
+num_classes: 32   # pad to multiple of 32 (labels 0-9 used)
+
+# Model
+hidden_dim: 256
+init_std: 0.02
+
+# Training
+batch_size: 32
+steps: 10
+lr: 1e-3
+beta1: 0.9
+beta2: 0.999
+eps: 1e-8
+weight_decay: 1e-2
+
+# Dumps
+# Number of steps to dump (0 = none). For parity, keep == steps.
+dump_steps: 10

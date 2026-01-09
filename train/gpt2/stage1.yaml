@@ -1,0 +1,26 @@
+# GPT2 rebuild stage1 (ln1)
+
+data_dir: /home/howard/ttnn-perf/train/gpt2/data
+outputs_dir: /home/howard/ttnn-perf/train/gpt2/outputs_stage1
+
+batch_size: 32
+seq: 32
+dim: 128
+heads: 4
+ffn_mult: 4
+vocab: 160
+
+stage: 1
+steps: 1
+lr: 0.0
+beta1: 0.9
+beta2: 0.999
+eps: 1e-8
+weight_decay: 0.0
+log_every: 1
+
+seed: 1
+init_std: 0.02
+ln_eps: 1e-5
+
+dump_outputs: 1

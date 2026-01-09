@@ -1,0 +1,19 @@
+{
+  "batch": 32,
+  "seq": 32,
+  "dim": 128,
+  "heads": 4,
+  "ffn_mult": 4,
+  "vocab": 160,
+  "stage": 0,
+  "steps": 1,
+  "lr": 0,
+  "beta1": 0.9,
+  "beta2": 0.999,
+  "eps": 1e-08,
+  "weight_decay": 0,
+  "log_every": 1,
+  "seed": 1,
+  "init_std": 0.02,
+  "ln_eps": 1e-05
+}

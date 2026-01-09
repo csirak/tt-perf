@@ -1,0 +1,16 @@
+{
+  "p": 127,
+  "train_frac": 0.8,
+  "pad_to": 32,
+  "batch_size": 256,
+  "dim": 128,
+  "heads": 4,
+  "ffn_mult": 4,
+  "layers": 2,
+  "loss_scale": 1,
+  "use_layer_norm": 1,
+  "ln_eps": 1e-05,
+  "lr": 0.001,
+  "vocab": 160,
+  "answer_pos": 3
+}

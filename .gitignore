@@ -5,6 +5,7 @@ build/
 
 # Profiling
 *.tracy
+*.bin
 .logs/
 **/profile_log_*.csv
 **/tracy_*.csv

@@ -1,0 +1,14 @@
+{
+  "train_samples": 256,
+  "batch_size": 32,
+  "steps": 10,
+  "pad_to": 1024,
+  "num_classes": 32,
+  "hidden_dim": 256,
+  "init_std": 0.02,
+  "lr": 0.001,
+  "beta1": 0.9,
+  "beta2": 0.999,
+  "eps": 1e-08,
+  "weight_decay": 0.01
+}

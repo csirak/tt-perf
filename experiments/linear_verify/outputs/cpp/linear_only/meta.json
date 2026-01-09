@@ -1,0 +1,9 @@
+{
+  "batch_size": 256,
+  "seq": 32,
+  "in_dim": 128,
+  "out_dim": 128,
+  "stage": 0,
+  "seed": 1,
+  "eps": 1e-05
+}

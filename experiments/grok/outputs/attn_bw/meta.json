@@ -1,0 +1,9 @@
+{
+  "batch": 32,
+  "seq": 32,
+  "dim": 128,
+  "heads": 4,
+  "seed": 1,
+  "init_std": 0.02,
+  "scale": 0.176777
+}

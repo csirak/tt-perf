@@ -1,0 +1,10 @@
+{
+  "train_samples": 256,
+  "pad_to": 1024,
+  "num_classes": 32,
+  "seed": 1,
+  "images_path": "/home/howard/ttnn-perf/experiments/mnist/data/train_images.bin",
+  "labels_path": "/home/howard/ttnn-perf/experiments/mnist/data/train_labels_u32.bin",
+  "raw_images": "/home/howard/ttnn-perf/experiments/mnist/data/train-images-idx3-ubyte.gz",
+  "raw_labels": "/home/howard/ttnn-perf/experiments/mnist/data/train-labels-idx1-ubyte.gz"
+}

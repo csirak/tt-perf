@@ -15,6 +15,17 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def rms_norm(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, eps: float, dtype: torch.dtype) -> torch.Tensor:
+    y = x.float()
+    var = y.pow(2).mean(dim=-1, keepdim=True)
+    y = y * torch.rsqrt(var + eps)
+    if weight is not None:
+        y = y * weight.float()
+    if bias is not None:
+        y = y + bias.float()
+    return y.to(dtype)
+
+
 def load_kv_yaml(path: Path) -> Dict[str, str]:
     cfg: Dict[str, str] = {}
     if not path.exists():
@@ -110,7 +121,7 @@ class ModularDivisionDataset:
 
 
 class TorchBlockLN(nn.Module):
-    def __init__(self, dim: int, heads: int, ffn_mult: int, ln_eps: float):
+    def __init__(self, dim: int, heads: int, ffn_mult: int, ln_eps: float, use_rms_norm: bool):
         super().__init__()
         if dim % heads != 0:
             raise ValueError("dim must be divisible by heads")
@@ -118,6 +129,7 @@ class TorchBlockLN(nn.Module):
         self.heads = heads
         self.head_dim = dim // heads
         self.scale = 1.0 / math.sqrt(self.head_dim)
+        self.use_rms_norm = use_rms_norm
 
         self.ln1 = nn.LayerNorm(dim, eps=ln_eps)
         self.wq = nn.Linear(dim, dim, bias=True)
@@ -131,7 +143,10 @@ class TorchBlockLN(nn.Module):
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
         batch, seq, dim = x.shape
-        h = F.layer_norm(x.float(), (dim,), self.ln1.weight.float(), self.ln1.bias.float(), self.ln1.eps).to(dtype)
+        if self.use_rms_norm:
+            h = rms_norm(x, self.ln1.weight, self.ln1.bias, self.ln1.eps, dtype)
+        else:
+            h = F.layer_norm(x.float(), (dim,), self.ln1.weight.float(), self.ln1.bias.float(), self.ln1.eps).to(dtype)
 
         q = (self.wq(h).view(batch, seq, self.heads, self.head_dim).transpose(1, 2)).to(dtype)
         k = (self.wk(h).view(batch, seq, self.heads, self.head_dim).transpose(1, 2)).to(dtype)
@@ -147,18 +162,23 @@ class TorchBlockLN(nn.Module):
         attn_out = self.wo(attn_out).to(dtype)
         x = (x + attn_out).to(dtype)
 
-        h2 = F.layer_norm(x.float(), (dim,), self.ln2.weight.float(), self.ln2.bias.float(), self.ln2.eps).to(dtype)
+        if self.use_rms_norm:
+            h2 = rms_norm(x, self.ln2.weight, self.ln2.bias, self.ln2.eps, dtype)
+        else:
+            h2 = F.layer_norm(x.float(), (dim,), self.ln2.weight.float(), self.ln2.bias.float(), self.ln2.eps).to(dtype)
         ffn = self.ffn2(F.gelu(self.ffn1(h2), approximate="none")).to(dtype)
         return (x + ffn).to(dtype)
 
 
 class TorchGrokModel(nn.Module):
-    def __init__(self, *, vocab_size: int, seq_len: int, dim: int, heads: int, ffn_mult: int, layers: int, ln_eps: float):
+    def __init__(self, *, vocab_size: int, seq_len: int, dim: int, heads: int, ffn_mult: int,
+                 layers: int, ln_eps: float, use_rms_norm: bool):
         super().__init__()
         self.tok = nn.Embedding(vocab_size, dim)
         self.pos = nn.Embedding(seq_len, dim)
-        self.blocks = nn.ModuleList([TorchBlockLN(dim, heads, ffn_mult, ln_eps) for _ in range(layers)])
+        self.blocks = nn.ModuleList([TorchBlockLN(dim, heads, ffn_mult, ln_eps, use_rms_norm) for _ in range(layers)])
         self.ln_final = nn.LayerNorm(dim, eps=ln_eps)
+        self.use_rms_norm = use_rms_norm
         self.out = nn.Linear(dim, vocab_size, bias=True)
 
     def forward(self, tokens: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
@@ -171,8 +191,11 @@ class TorchGrokModel(nn.Module):
         )
         for block in self.blocks:
             x = block(x, mask, dtype)
-        x = F.layer_norm(x.float(), (x.shape[-1],), self.ln_final.weight.float(), self.ln_final.bias.float(),
-                         self.ln_final.eps).to(dtype)
+        if self.use_rms_norm:
+            x = rms_norm(x, self.ln_final.weight, self.ln_final.bias, self.ln_final.eps, dtype)
+        else:
+            x = F.layer_norm(x.float(), (x.shape[-1],), self.ln_final.weight.float(), self.ln_final.bias.float(),
+                             self.ln_final.eps).to(dtype)
         return self.out(x).to(dtype)
 
 
@@ -196,13 +219,24 @@ def init_weights_like_ttnn(model: TorchGrokModel, dim: int):
 def write_header(path: Path):
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
-        f.write("step\ttrain_loss\tval_loss\tinterval_s\ttotal_s\tavg_step_s\n")
+        f.write("step\ttrain_loss\tval_loss\tgrad_norm\tinterval_s\ttotal_s\tavg_step_s\n")
 
 
-def append_row(path: Path, step: int, train_loss: float, val_loss: float, interval_s: float, total_s: float):
+def append_row(path: Path, step: int, train_loss: float, val_loss: float, grad_norm: float,
+               interval_s: float, total_s: float):
     avg_step_s = total_s / step if step > 0 else 0.0
     with path.open("a", encoding="utf-8") as f:
-        f.write(f"{step}\t{train_loss}\t{val_loss}\t{interval_s:.6f}\t{total_s:.6f}\t{avg_step_s:.6f}\n")
+        f.write(f"{step}\t{train_loss}\t{val_loss}\t{grad_norm:.6f}\t{interval_s:.6f}\t{total_s:.6f}\t{avg_step_s:.6f}\n")
+
+
+def grad_norm(params) -> float:
+    total = 0.0
+    for p in params:
+        if p.grad is None:
+            continue
+        g = p.grad.float()
+        total += float(torch.sum(g * g).item())
+    return math.sqrt(total)
 
 
 def main() -> None:
@@ -232,6 +266,7 @@ def main() -> None:
     ffn_mult = get_int(cfg, "ffn_mult", 4)
     layers = get_int(cfg, "layers", 2)
     ln_eps = get_float(cfg, "ln_eps", 1e-5)
+    use_rms_norm = get_int(cfg, "use_rms_norm", 0) != 0
 
     out_path = Path(get_str(cfg, "csv", "/tmp/torch_grok_results.tsv"))
     if out_path.exists():
@@ -244,7 +279,8 @@ def main() -> None:
 
     dataset = ModularDivisionDataset(p=p, train_frac=train_frac, pad_to=pad_to, seed=seed)
     model = TorchGrokModel(vocab_size=dataset.vocab_size, seq_len=dataset.seq_len,
-                           dim=dim, heads=heads, ffn_mult=ffn_mult, layers=layers, ln_eps=ln_eps).to(device)
+                           dim=dim, heads=heads, ffn_mult=ffn_mult, layers=layers,
+                           ln_eps=ln_eps, use_rms_norm=use_rms_norm).to(device)
     init_weights_like_ttnn(model, dim)
     model = model.to(dtype)
 
@@ -268,6 +304,7 @@ def main() -> None:
         eps=eps,
     )
 
+    params = [p for p in model.parameters() if p.requires_grad]
     start = time.perf_counter()
     last = start
     for step in range(1, steps + 1):
@@ -280,6 +317,7 @@ def main() -> None:
         log_probs = torch.log_softmax(logits_last.float(), dim=-1)
         loss = -log_probs[torch.arange(batch_size), targets].mean()
         loss.backward()
+        gnorm = grad_norm(params)
         optim.step()
         optim.zero_grad()
 
@@ -299,7 +337,7 @@ def main() -> None:
             interval_s = now - last
             total_s = now - start
             last = now
-            append_row(out_path, step, train_loss, val_loss, interval_s, total_s)
+            append_row(out_path, step, train_loss, val_loss, gnorm, interval_s, total_s)
             print(f"step {step} train_loss {train_loss:.6f} val_loss {val_loss:.6f} interval_s {interval_s:.2f} total_s {total_s:.2f}")
 
 

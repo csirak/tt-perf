@@ -63,7 +63,8 @@ template <typename T, typename = void>
 struct has_ln_final : std::false_type {};
 
 template <typename T>
-struct has_ln_final<T, std::void_t<decltype(std::declval<T>().ln_final)>> : std::true_type {};
+struct has_ln_final<T, std::void_t<decltype(std::declval<T>().ln_final)>>
+    : std::bool_constant<!std::is_same_v<std::decay_t<decltype(std::declval<T>().ln_final)>, EmptyFinalNorm>> {};
 
 struct Config {
     uint32_t p = 127;
@@ -90,6 +91,7 @@ struct Config {
     uint32_t layers = 2;
     float loss_scale = 1.0f;
     uint32_t use_layer_norm = 0;
+    uint32_t use_rms_norm = 0;
     float ln_eps = 1e-5f;
     uint32_t dump_outputs = 0;
     uint32_t dump_steps = 0;
@@ -127,6 +129,7 @@ Config load_config(const std::string& path) {
     get_u32(kv, "layers", cfg.layers);
     get_f32(kv, "loss_scale", cfg.loss_scale);
     get_u32(kv, "use_layer_norm", cfg.use_layer_norm);
+    get_u32(kv, "use_rms_norm", cfg.use_rms_norm);
     get_f32(kv, "ln_eps", cfg.ln_eps);
     get_u32(kv, "dump_outputs", cfg.dump_outputs);
     get_u32(kv, "dump_steps", cfg.dump_steps);
@@ -239,6 +242,7 @@ void write_meta(const std::string& dir, const Config& cfg, const grokking::Modul
     file << "  \"layers\": " << cfg.layers << ",\n";
     file << "  \"loss_scale\": " << cfg.loss_scale << ",\n";
     file << "  \"use_layer_norm\": " << cfg.use_layer_norm << ",\n";
+    file << "  \"use_rms_norm\": " << cfg.use_rms_norm << ",\n";
     file << "  \"ln_eps\": " << cfg.ln_eps << ",\n";
     file << "  \"lr\": " << cfg.lr << ",\n";
     file << "  \"vocab\": " << dataset.vocab_size << ",\n";
@@ -246,28 +250,147 @@ void write_meta(const std::string& dir, const Config& cfg, const grokking::Modul
     file << "}\n";
 }
 
+template <typename Norm>
 void save_norm_params(const std::filesystem::path& dir,
                       const std::string& prefix,
-                      DyT& ln,
+                      Norm& ln,
                       MeshDevice& device);
 
-void save_norm_params(const std::filesystem::path& dir,
-                      const std::string& prefix,
-                      LayerNorm& ln,
-                      MeshDevice& device);
-
+template <typename Norm>
 void save_norm_grads(const std::filesystem::path& dir,
                      const std::string& prefix,
-                     DyT& ln,
+                     Norm& ln,
                      MeshDevice& device);
 
-void save_norm_grads(const std::filesystem::path& dir,
-                     const std::string& prefix,
-                     LayerNorm& ln,
-                     MeshDevice& device);
+template <typename Norm>
+void accum_norm_sumsq(Norm& ln, double& sum);
 
-void accum_norm_sumsq(DyT& ln, double& sum);
-void accum_norm_sumsq(LayerNorm& ln, double& sum);
+template <size_t N, typename Model>
+void save_model_weights(const std::filesystem::path& dir,
+                        Model& model,
+                        MeshDevice& device) {
+    traced::save_tensor(model.tok.weight, (dir / "tok_weight.bin").string(), &device);
+    traced::save_tensor(model.pos.weight, (dir / "pos_weight.bin").string(), &device);
+    traced::save_tensor(model.output_proj.weight, (dir / "output_weight.bin").string(), &device);
+    traced::save_tensor(model.output_proj.bias, (dir / "output_bias.bin").string(), &device);
+
+    for (size_t i = 0; i < N; ++i) {
+        auto& layer = model.layers[i];
+        auto prefix = fmt::format("layer{}", i);
+        save_norm_params(dir, prefix + "_ln1", layer.ln1, device);
+        save_norm_params(dir, prefix + "_ln2", layer.ln2, device);
+
+        traced::save_tensor(layer.wq.weight, (dir / (prefix + "_wq_weight.bin")).string(), &device);
+        traced::save_tensor(layer.wq.bias, (dir / (prefix + "_wq_bias.bin")).string(), &device);
+        traced::save_tensor(layer.wk.weight, (dir / (prefix + "_wk_weight.bin")).string(), &device);
+        traced::save_tensor(layer.wk.bias, (dir / (prefix + "_wk_bias.bin")).string(), &device);
+        traced::save_tensor(layer.wv.weight, (dir / (prefix + "_wv_weight.bin")).string(), &device);
+        traced::save_tensor(layer.wv.bias, (dir / (prefix + "_wv_bias.bin")).string(), &device);
+        traced::save_tensor(layer.wo.weight, (dir / (prefix + "_wo_weight.bin")).string(), &device);
+        traced::save_tensor(layer.wo.bias, (dir / (prefix + "_wo_bias.bin")).string(), &device);
+
+        traced::save_tensor(layer.ffn.w1.weight, (dir / (prefix + "_ffn_w1_weight.bin")).string(), &device);
+        traced::save_tensor(layer.ffn.w1.bias, (dir / (prefix + "_ffn_w1_bias.bin")).string(), &device);
+        traced::save_tensor(layer.ffn.w2.weight, (dir / (prefix + "_ffn_w2_weight.bin")).string(), &device);
+        traced::save_tensor(layer.ffn.w2.bias, (dir / (prefix + "_ffn_w2_bias.bin")).string(), &device);
+    }
+
+    if constexpr (has_ln_final<Model>::value) {
+        save_norm_params(dir, "ln_final", model.ln_final, device);
+    }
+}
+
+template <size_t N, typename Model>
+void save_model_activations(const std::filesystem::path& dir,
+                            Model& model,
+                            MeshDevice& device) {
+    traced::save_tensor(model.tok_plus_pos, (dir / "tok_plus_pos.bin").string(), &device);
+
+    for (size_t i = 0; i < N; ++i) {
+        auto& layer = model.layers[i];
+        auto prefix = fmt::format("layer{}", i);
+        Tensor* layer_input = (i == 0) ? &model.tok_plus_pos : &model.layers[i - 1].output;
+
+        traced::save_tensor(*layer_input, (dir / (prefix + "_input.bin")).string(), &device);
+        traced::save_tensor(layer.ln1.out, (dir / (prefix + "_ln1.bin")).string(), &device);
+        traced::save_tensor(layer.wq.out, (dir / (prefix + "_wq.bin")).string(), &device);
+        traced::save_tensor(layer.wk.out, (dir / (prefix + "_wk.bin")).string(), &device);
+        traced::save_tensor(layer.wv.out, (dir / (prefix + "_wv.bin")).string(), &device);
+        traced::save_tensor(layer.attn_scores, (dir / (prefix + "_attn_scores.bin")).string(), &device);
+        traced::save_tensor(layer.attn_weights, (dir / (prefix + "_attn_weights.bin")).string(), &device);
+        traced::save_tensor(layer.attn_out, (dir / (prefix + "_attn_out.bin")).string(), &device);
+        traced::save_tensor(layer.wo.out, (dir / (prefix + "_wo.bin")).string(), &device);
+        traced::save_tensor(layer.residual1, (dir / (prefix + "_residual1.bin")).string(), &device);
+        traced::save_tensor(layer.ln2.out, (dir / (prefix + "_ln2.bin")).string(), &device);
+        traced::save_tensor(layer.ffn.w1.out, (dir / (prefix + "_ffn_w1.bin")).string(), &device);
+        traced::save_tensor(layer.ffn.gelu_out, (dir / (prefix + "_ffn_gelu.bin")).string(), &device);
+        traced::save_tensor(layer.ffn.w2.out, (dir / (prefix + "_ffn_w2.bin")).string(), &device);
+        traced::save_tensor(layer.output, (dir / (prefix + "_output.bin")).string(), &device);
+    }
+
+    if constexpr (has_ln_final<Model>::value) {
+        traced::save_tensor(model.ln_final.out, (dir / "ln_final.bin").string(), &device);
+    }
+
+    traced::save_tensor(model.output_proj.out, (dir / "logits.bin").string(), &device);
+}
+
+template <size_t N, typename Model>
+void save_model_snapshot(const std::filesystem::path& dir,
+                         const Config& cfg,
+                         const grokking::Batch& batch,
+                         Model& model,
+                         LastTokenCrossEntropy& loss,
+                         MeshDevice& device) {
+    auto tokens_tensor = make_host_bf16(batch.tokens, ttnn::Shape({cfg.batch_size, cfg.pad_to}));
+    auto targets_tensor = make_host_bf16(batch.targets, ttnn::Shape({cfg.batch_size}));
+    traced::save_tensor(tokens_tensor, (dir / "tokens.bin").string());
+    traced::save_tensor(targets_tensor, (dir / "targets.bin").string());
+
+    save_model_weights<N>(dir, model, device);
+    save_model_activations<N>(dir, model, device);
+
+    auto loss_1d = ttnn::reshape(loss.loss, ttnn::Shape({1}));
+    traced::save_tensor(loss_1d, (dir / "loss.bin").string(), &device);
+}
+
+template <typename Linear>
+void save_linear_grads(const std::filesystem::path& dir,
+                       const std::string& prefix,
+                       Linear& layer,
+                       MeshDevice& device) {
+    traced::save_tensor(layer.d_weight, (dir / (prefix + "_weight_grad.bin")).string(), &device);
+    traced::save_tensor(layer.d_bias, (dir / (prefix + "_bias_grad.bin")).string(), &device);
+}
+
+template <size_t N, typename Model>
+void save_model_gradients(const std::filesystem::path& dir,
+                          Model& model,
+                          MeshDevice& device) {
+    traced::save_tensor(model.tok.d_weight, (dir / "tok_weight_grad.bin").string(), &device);
+    traced::save_tensor(model.pos.d_weight, (dir / "pos_weight_grad.bin").string(), &device);
+    traced::save_tensor(model.d_tok_plus_pos, (dir / "tok_plus_pos_grad.bin").string(), &device);
+
+    for (size_t i = 0; i < N; ++i) {
+        auto& layer = model.layers[i];
+        auto prefix = fmt::format("layer{}", i);
+        save_norm_grads(dir, prefix + "_ln1", layer.ln1, device);
+        save_norm_grads(dir, prefix + "_ln2", layer.ln2, device);
+
+        save_linear_grads(dir, prefix + "_wq", layer.wq, device);
+        save_linear_grads(dir, prefix + "_wk", layer.wk, device);
+        save_linear_grads(dir, prefix + "_wv", layer.wv, device);
+        save_linear_grads(dir, prefix + "_wo", layer.wo, device);
+        save_linear_grads(dir, prefix + "_ffn_w1", layer.ffn.w1, device);
+        save_linear_grads(dir, prefix + "_ffn_w2", layer.ffn.w2, device);
+    }
+
+    if constexpr (has_ln_final<Model>::value) {
+        save_norm_grads(dir, "ln_final", model.ln_final, device);
+    }
+
+    save_linear_grads(dir, "output", model.output_proj, device);
+}
 
 template <size_t N, typename Model>
 void dump_grok_outputs(const std::string& dir,
@@ -280,66 +403,8 @@ void dump_grok_outputs(const std::string& dir,
     write_meta(dir, cfg, dataset);
     tt::tt_metal::distributed::Synchronize(&device, std::nullopt);
 
-    auto tokens_tensor = make_host_bf16(batch.tokens, ttnn::Shape({cfg.batch_size, cfg.pad_to}));
-    auto targets_tensor = make_host_bf16(batch.targets, ttnn::Shape({cfg.batch_size}));
-    traced::save_tensor(tokens_tensor, (std::filesystem::path(dir) / "tokens.bin").string());
-    traced::save_tensor(targets_tensor, (std::filesystem::path(dir) / "targets.bin").string());
-
-    traced::save_tensor(model.tok.weight, (std::filesystem::path(dir) / "tok_weight.bin").string(), &device);
-    traced::save_tensor(model.pos.weight, (std::filesystem::path(dir) / "pos_weight.bin").string(), &device);
-    traced::save_tensor(model.output_proj.weight, (std::filesystem::path(dir) / "output_weight.bin").string(), &device);
-    traced::save_tensor(model.output_proj.bias, (std::filesystem::path(dir) / "output_bias.bin").string(), &device);
-
-    traced::save_tensor(model.tok_plus_pos, (std::filesystem::path(dir) / "tok_plus_pos.bin").string(), &device);
-
-    for (size_t i = 0; i < N; ++i) {
-        auto& layer = model.layers[i];
-        auto prefix = fmt::format("layer{}", i);
-        auto base = std::filesystem::path(dir);
-        save_norm_params(base, prefix + "_ln1", layer.ln1, device);
-        save_norm_params(base, prefix + "_ln2", layer.ln2, device);
-
-        traced::save_tensor(layer.wq.weight, (std::filesystem::path(dir) / (prefix + "_wq_weight.bin")).string(), &device);
-        traced::save_tensor(layer.wq.bias, (std::filesystem::path(dir) / (prefix + "_wq_bias.bin")).string(), &device);
-        traced::save_tensor(layer.wk.weight, (std::filesystem::path(dir) / (prefix + "_wk_weight.bin")).string(), &device);
-        traced::save_tensor(layer.wk.bias, (std::filesystem::path(dir) / (prefix + "_wk_bias.bin")).string(), &device);
-        traced::save_tensor(layer.wv.weight, (std::filesystem::path(dir) / (prefix + "_wv_weight.bin")).string(), &device);
-        traced::save_tensor(layer.wv.bias, (std::filesystem::path(dir) / (prefix + "_wv_bias.bin")).string(), &device);
-        traced::save_tensor(layer.wo.weight, (std::filesystem::path(dir) / (prefix + "_wo_weight.bin")).string(), &device);
-        traced::save_tensor(layer.wo.bias, (std::filesystem::path(dir) / (prefix + "_wo_bias.bin")).string(), &device);
-
-        traced::save_tensor(layer.ffn.w1.weight, (std::filesystem::path(dir) / (prefix + "_ffn_w1_weight.bin")).string(), &device);
-        traced::save_tensor(layer.ffn.w1.bias, (std::filesystem::path(dir) / (prefix + "_ffn_w1_bias.bin")).string(), &device);
-        traced::save_tensor(layer.ffn.w2.weight, (std::filesystem::path(dir) / (prefix + "_ffn_w2_weight.bin")).string(), &device);
-        traced::save_tensor(layer.ffn.w2.bias, (std::filesystem::path(dir) / (prefix + "_ffn_w2_bias.bin")).string(), &device);
-
-        Tensor* layer_input = (i == 0) ? &model.tok_plus_pos : &model.layers[i - 1].output;
-        traced::save_tensor(*layer_input, (std::filesystem::path(dir) / (prefix + "_input.bin")).string(), &device);
-        traced::save_tensor(layer.ln1.out, (std::filesystem::path(dir) / (prefix + "_ln1.bin")).string(), &device);
-        traced::save_tensor(layer.wq.out, (std::filesystem::path(dir) / (prefix + "_wq.bin")).string(), &device);
-        traced::save_tensor(layer.wk.out, (std::filesystem::path(dir) / (prefix + "_wk.bin")).string(), &device);
-        traced::save_tensor(layer.wv.out, (std::filesystem::path(dir) / (prefix + "_wv.bin")).string(), &device);
-        traced::save_tensor(layer.attn_scores, (std::filesystem::path(dir) / (prefix + "_attn_scores.bin")).string(), &device);
-        traced::save_tensor(layer.attn_weights, (std::filesystem::path(dir) / (prefix + "_attn_weights.bin")).string(), &device);
-        traced::save_tensor(layer.attn_out, (std::filesystem::path(dir) / (prefix + "_attn_out.bin")).string(), &device);
-        traced::save_tensor(layer.wo.out, (std::filesystem::path(dir) / (prefix + "_wo.bin")).string(), &device);
-        traced::save_tensor(layer.residual1, (std::filesystem::path(dir) / (prefix + "_residual1.bin")).string(), &device);
-        traced::save_tensor(layer.ln2.out, (std::filesystem::path(dir) / (prefix + "_ln2.bin")).string(), &device);
-        traced::save_tensor(layer.ffn.w1.out, (std::filesystem::path(dir) / (prefix + "_ffn_w1.bin")).string(), &device);
-        traced::save_tensor(layer.ffn.gelu_out, (std::filesystem::path(dir) / (prefix + "_ffn_gelu.bin")).string(), &device);
-        traced::save_tensor(layer.ffn.w2.out, (std::filesystem::path(dir) / (prefix + "_ffn_w2.bin")).string(), &device);
-        traced::save_tensor(layer.output, (std::filesystem::path(dir) / (prefix + "_output.bin")).string(), &device);
-    }
-
-    if constexpr (has_ln_final<Model>::value) {
-        auto base = std::filesystem::path(dir);
-        save_norm_params(base, "ln_final", model.ln_final, device);
-        traced::save_tensor(model.ln_final.out, (base / "ln_final.bin").string(), &device);
-    }
-
-    traced::save_tensor(model.output_proj.out, (std::filesystem::path(dir) / "logits.bin").string(), &device);
-    auto loss_1d = ttnn::reshape(loss.loss, ttnn::Shape({1}));
-    traced::save_tensor(loss_1d, (std::filesystem::path(dir) / "loss.bin").string(), &device);
+    auto base = std::filesystem::path(dir);
+    save_model_snapshot<N>(base, cfg, batch, model, loss, device);
 }
 
 void ensure_dir(const std::string& dir) {
@@ -357,47 +422,35 @@ double sumsq_bf16(const Tensor& t) {
     return sum;
 }
 
+template <typename Norm>
 void save_norm_params(const std::filesystem::path& dir,
                       const std::string& prefix,
-                      DyT& ln,
+                      Norm& ln,
                       MeshDevice& device) {
-    traced::save_tensor(ln.alpha, (dir / (prefix + "_alpha.bin")).string(), &device);
+    if constexpr (std::is_same_v<Norm, DyT>) {
+        traced::save_tensor(ln.alpha, (dir / (prefix + "_alpha.bin")).string(), &device);
+    }
     traced::save_tensor(ln.gamma, (dir / (prefix + "_gamma.bin")).string(), &device);
     traced::save_tensor(ln.beta, (dir / (prefix + "_beta.bin")).string(), &device);
 }
 
-void save_norm_params(const std::filesystem::path& dir,
-                      const std::string& prefix,
-                      LayerNorm& ln,
-                      MeshDevice& device) {
-    traced::save_tensor(ln.gamma, (dir / (prefix + "_gamma.bin")).string(), &device);
-    traced::save_tensor(ln.beta, (dir / (prefix + "_beta.bin")).string(), &device);
-}
-
+template <typename Norm>
 void save_norm_grads(const std::filesystem::path& dir,
                      const std::string& prefix,
-                     DyT& ln,
+                     Norm& ln,
                      MeshDevice& device) {
-    traced::save_tensor(ln.d_alpha, (dir / (prefix + "_alpha_grad.bin")).string(), &device);
+    if constexpr (std::is_same_v<Norm, DyT>) {
+        traced::save_tensor(ln.d_alpha, (dir / (prefix + "_alpha_grad.bin")).string(), &device);
+    }
     traced::save_tensor(ln.d_gamma, (dir / (prefix + "_gamma_grad.bin")).string(), &device);
     traced::save_tensor(ln.d_beta, (dir / (prefix + "_beta_grad.bin")).string(), &device);
 }
 
-void save_norm_grads(const std::filesystem::path& dir,
-                     const std::string& prefix,
-                     LayerNorm& ln,
-                     MeshDevice& device) {
-    traced::save_tensor(ln.d_gamma, (dir / (prefix + "_gamma_grad.bin")).string(), &device);
-    traced::save_tensor(ln.d_beta, (dir / (prefix + "_beta_grad.bin")).string(), &device);
-}
-
-void accum_norm_sumsq(DyT& ln, double& sum) {
-    sum += sumsq_bf16(ln.d_alpha);
-    sum += sumsq_bf16(ln.d_gamma);
-    sum += sumsq_bf16(ln.d_beta);
-}
-
-void accum_norm_sumsq(LayerNorm& ln, double& sum) {
+template <typename Norm>
+void accum_norm_sumsq(Norm& ln, double& sum) {
+    if constexpr (std::is_same_v<Norm, DyT>) {
+        sum += sumsq_bf16(ln.d_alpha);
+    }
     sum += sumsq_bf16(ln.d_gamma);
     sum += sumsq_bf16(ln.d_beta);
 }
@@ -518,54 +571,8 @@ void dump_grok_gradients(const std::string& dir,
                          Model& model,
                          MeshDevice& device) {
     tt::tt_metal::distributed::Synchronize(&device, std::nullopt);
-
-    traced::save_tensor(model.tok.d_weight, (std::filesystem::path(dir) / "tok_weight_grad.bin").string(), &device);
-    traced::save_tensor(model.pos.d_weight, (std::filesystem::path(dir) / "pos_weight_grad.bin").string(), &device);
-    traced::save_tensor(model.d_tok_plus_pos,
-                        (std::filesystem::path(dir) / "tok_plus_pos_grad.bin").string(), &device);
-
-    for (size_t i = 0; i < N; ++i) {
-        auto& layer = model.layers[i];
-        auto prefix = fmt::format("layer{}", i);
-        auto base = std::filesystem::path(dir);
-        save_norm_grads(base, prefix + "_ln1", layer.ln1, device);
-        save_norm_grads(base, prefix + "_ln2", layer.ln2, device);
-
-        traced::save_tensor(layer.wq.d_weight,
-                            (std::filesystem::path(dir) / (prefix + "_wq_weight_grad.bin")).string(), &device);
-        traced::save_tensor(layer.wq.d_bias,
-                            (std::filesystem::path(dir) / (prefix + "_wq_bias_grad.bin")).string(), &device);
-        traced::save_tensor(layer.wk.d_weight,
-                            (std::filesystem::path(dir) / (prefix + "_wk_weight_grad.bin")).string(), &device);
-        traced::save_tensor(layer.wk.d_bias,
-                            (std::filesystem::path(dir) / (prefix + "_wk_bias_grad.bin")).string(), &device);
-        traced::save_tensor(layer.wv.d_weight,
-                            (std::filesystem::path(dir) / (prefix + "_wv_weight_grad.bin")).string(), &device);
-        traced::save_tensor(layer.wv.d_bias,
-                            (std::filesystem::path(dir) / (prefix + "_wv_bias_grad.bin")).string(), &device);
-        traced::save_tensor(layer.wo.d_weight,
-                            (std::filesystem::path(dir) / (prefix + "_wo_weight_grad.bin")).string(), &device);
-        traced::save_tensor(layer.wo.d_bias,
-                            (std::filesystem::path(dir) / (prefix + "_wo_bias_grad.bin")).string(), &device);
-
-        traced::save_tensor(layer.ffn.w1.d_weight,
-                            (std::filesystem::path(dir) / (prefix + "_ffn_w1_weight_grad.bin")).string(), &device);
-        traced::save_tensor(layer.ffn.w1.d_bias,
-                            (std::filesystem::path(dir) / (prefix + "_ffn_w1_bias_grad.bin")).string(), &device);
-        traced::save_tensor(layer.ffn.w2.d_weight,
-                            (std::filesystem::path(dir) / (prefix + "_ffn_w2_weight_grad.bin")).string(), &device);
-        traced::save_tensor(layer.ffn.w2.d_bias,
-                            (std::filesystem::path(dir) / (prefix + "_ffn_w2_bias_grad.bin")).string(), &device);
-    }
-
-    if constexpr (has_ln_final<Model>::value) {
-        save_norm_grads(std::filesystem::path(dir), "ln_final", model.ln_final, device);
-    }
-
-    traced::save_tensor(model.output_proj.d_weight,
-                        (std::filesystem::path(dir) / "output_weight_grad.bin").string(), &device);
-    traced::save_tensor(model.output_proj.d_bias,
-                        (std::filesystem::path(dir) / "output_bias_grad.bin").string(), &device);
+    auto base = std::filesystem::path(dir);
+    save_model_gradients<N>(base, model, device);
 }
 
 void dump_step_batch(const std::string& dir, uint32_t step,
@@ -600,9 +607,10 @@ int run_train(const Config& cfg, MeshDevice& device, ModelFactory make_model) {
 
     fmt::print("# Grokking config: p={}, train_frac={}, pad_to={}, vocab={}, batch={}\n",
                cfg.p, cfg.train_frac, cfg.pad_to, dataset.vocab_size, cfg.batch_size);
+    const char* norm_name = cfg.use_rms_norm ? "rms_norm"
+                           : (cfg.use_layer_norm ? "layer_norm" : "dyt");
     fmt::print("# Model: dim={}, heads={}, ffn_mult={}, layers={}, norm={}\n",
-               cfg.dim, cfg.heads, cfg.ffn_mult, cfg.layers,
-               cfg.use_layer_norm ? "layer_norm" : "dyt");
+               cfg.dim, cfg.heads, cfg.ffn_mult, cfg.layers, norm_name);
 
     // Setup optimizer
     bool use_adam = (cfg.optimizer == "adam" || cfg.optimizer == "adamw");
@@ -760,6 +768,13 @@ int run_train(const Config& cfg, MeshDevice& device, ModelFactory make_model) {
 
 template <size_t N>
 int run_train_select(const Config& cfg, MeshDevice& device) {
+    if (cfg.use_rms_norm != 0) {
+        return run_train<N>(cfg, device, [&](const grokking::ModularDivisionDataset& dataset) {
+            return PersistentGrokGPT2RMS<N>(cfg.batch_size, cfg.pad_to, cfg.dim, cfg.heads,
+                                            cfg.ffn_mult, dataset.vocab_size, cfg.lr, cfg.ln_eps, device);
+        });
+    }
+
     if (cfg.use_layer_norm != 0) {
         return run_train<N>(cfg, device, [&](const grokking::ModularDivisionDataset& dataset) {
             return PersistentGrokGPT2LN<N>(cfg.batch_size, cfg.pad_to, cfg.dim, cfg.heads,

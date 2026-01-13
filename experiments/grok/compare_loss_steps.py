@@ -28,6 +28,16 @@ def layer_norm(x, gamma, beta, eps, dtype):
     y = F.layer_norm(x.float(), (x.shape[-1],), g, b, eps)
     return y.to(dtype)
 
+def rms_norm(x, gamma, beta, eps, dtype):
+    y = x.float()
+    var = y.pow(2).mean(dim=-1, keepdim=True)
+    y = y * torch.rsqrt(var + eps)
+    if gamma is not None:
+        y = y * gamma.float()
+    if beta is not None:
+        y = y + beta.float()
+    return y.to(dtype)
+
 
 def linear3d(x, weight, bias, dtype):
     return (torch.matmul(x, weight.t()) + bias).to(dtype)
@@ -100,6 +110,7 @@ def main():
     loss_scale = float(meta.get("loss_scale", 1.0))
     lr = float(meta.get("lr", 1e-3))
     use_layer_norm = int(meta.get("use_layer_norm", 0))
+    use_rms_norm = int(meta.get("use_rms_norm", 0))
     ln_eps = float(meta.get("ln_eps", 1e-5))
 
     dtype = torch.bfloat16
@@ -113,13 +124,13 @@ def main():
     layer_params = []
     ln_final_gamma = None
     ln_final_beta = None
-    if use_layer_norm:
+    if use_rms_norm or use_layer_norm:
         ln_final_gamma = load_tensor(str(cpp_dir / "ln_final_gamma.bin")).to(dtype).requires_grad_()
         ln_final_beta = load_tensor(str(cpp_dir / "ln_final_beta.bin")).to(dtype).requires_grad_()
         params.extend([ln_final_gamma, ln_final_beta])
     for layer in range(layers):
         prefix = f"layer{layer}"
-        if use_layer_norm:
+        if use_rms_norm or use_layer_norm:
             ln1_gamma = load_tensor(str(cpp_dir / f"{prefix}_ln1_gamma.bin")).to(dtype).requires_grad_()
             ln1_beta = load_tensor(str(cpp_dir / f"{prefix}_ln1_beta.bin")).to(dtype).requires_grad_()
             ln2_gamma = load_tensor(str(cpp_dir / f"{prefix}_ln2_gamma.bin")).to(dtype).requires_grad_()
@@ -146,7 +157,7 @@ def main():
         ffn_w2 = load_tensor(str(cpp_dir / f"{prefix}_ffn_w2_weight.bin")).to(dtype).requires_grad_()
         ffn_b2 = load_tensor(str(cpp_dir / f"{prefix}_ffn_w2_bias.bin")).to(dtype).requires_grad_()
 
-        if use_layer_norm:
+        if use_rms_norm or use_layer_norm:
             params.extend([
                 ln1_gamma, ln1_beta, ln2_gamma, ln2_beta,
                 wq_w, wq_b, wk_w, wk_b, wv_w, wv_b, wo_w, wo_b,
@@ -210,7 +221,12 @@ def main():
         row = [step, *l2_l1(h)]
 
         for params_tuple in layer_params:
-            if use_layer_norm:
+            if use_rms_norm:
+                (ln1_gamma, ln1_beta, ln2_gamma, ln2_beta,
+                 wq_w, wq_b, wk_w, wk_b, wv_w, wv_b, wo_w, wo_b,
+                 ffn_w1, ffn_b1, ffn_w2, ffn_b2) = params_tuple
+                ln1_out = rms_norm(h, ln1_gamma, ln1_beta, ln_eps, dtype)
+            elif use_layer_norm:
                 (ln1_gamma, ln1_beta, ln2_gamma, ln2_beta,
                  wq_w, wq_b, wk_w, wk_b, wv_w, wv_b, wo_w, wo_b,
                  ffn_w1, ffn_b1, ffn_w2, ffn_b2) = params_tuple
@@ -237,7 +253,9 @@ def main():
             row += [*l2_l1(attn_out)]
             wo_out = linear3d(attn_out, wo_w, wo_b, dtype)
             residual1 = (h + wo_out).to(dtype)
-            if use_layer_norm:
+            if use_rms_norm:
+                ln2_out = rms_norm(residual1, ln2_gamma, ln2_beta, ln_eps, dtype)
+            elif use_layer_norm:
                 ln2_out = layer_norm(residual1, ln2_gamma, ln2_beta, ln_eps, dtype)
             else:
                 ln2_out = dyt(residual1, ln2_alpha, ln2_gamma, ln2_beta, dtype)
@@ -247,7 +265,9 @@ def main():
             h = (residual1 + ffn_out).to(dtype)
             row += [*l2_l1(h)]
 
-        if use_layer_norm:
+        if use_rms_norm:
+            h = rms_norm(h, ln_final_gamma, ln_final_beta, ln_eps, dtype)
+        elif use_layer_norm:
             h = layer_norm(h, ln_final_gamma, ln_final_beta, ln_eps, dtype)
         logits = linear3d(h, out_w, out_b, dtype)
         row += [*l2_l1(logits)]

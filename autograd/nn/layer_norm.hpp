@@ -3,6 +3,7 @@
 #include "common.hpp"
 #include <ttnn/operations/data_movement/repeat/repeat.hpp>
 #include <ttnn/operations/normalization/layernorm/layernorm.hpp>
+#include <ttnn/operations/normalization/rmsnorm/rmsnorm.hpp>
 
 namespace static_autograd {
 
@@ -132,6 +133,127 @@ struct LayerNorm {
     void sgd_step(float lr, float momentum = 0.0f, float weight_decay = 0.0f) {
         if (momentum > 0.0f) {
             // v = momentum * v + grad (no wd on LN params)
+            v_gamma = ttnn::add(ttnn::multiply(v_gamma, momentum), d_gamma);
+            v_beta = ttnn::add(ttnn::multiply(v_beta, momentum), d_beta);
+            gamma = ttnn::subtract(gamma, ttnn::multiply(v_gamma, lr));
+            beta = ttnn::subtract(beta, ttnn::multiply(v_beta, lr));
+        } else {
+            gamma = ttnn::subtract(gamma, ttnn::multiply(d_gamma, lr));
+            beta = ttnn::subtract(beta, ttnn::multiply(d_beta, lr));
+        }
+    }
+};
+
+// =============================================================================
+// RMSNorm: Root Mean Square Normalization
+// y = (x / sqrt(mean(x^2) + eps)) * gamma + beta
+// Uses ttnn::rms_norm for forward; backward computed manually.
+// =============================================================================
+
+struct RMSNorm {
+    Tensor gamma;       // [1, 1, D]
+    Tensor beta;        // [1, 1, D]
+    Tensor d_gamma;
+    Tensor d_beta;
+
+    Tensor v_gamma;
+    Tensor v_beta;
+
+    Tensor out;
+    Tensor d_out;
+    Tensor x_norm;      // x * rstd
+    Tensor rstd;        // [B, S, 1]
+
+    uint32_t batch;
+    uint32_t seq;
+    uint32_t dim;
+    float eps;
+
+    RMSNorm(uint32_t batch_, uint32_t seq_, uint32_t d, float epsilon, MeshDevice& dev)
+        : gamma(make_full(ttnn::Shape({1, 1, d}), 1.0f, dev)),
+          beta(make_zeros(ttnn::Shape({1, 1, d}), dev)),
+          d_gamma(make_zeros(ttnn::Shape({1, 1, d}), dev)),
+          d_beta(make_zeros(ttnn::Shape({1, 1, d}), dev)),
+          v_gamma(make_zeros(ttnn::Shape({1, 1, d}), dev)),
+          v_beta(make_zeros(ttnn::Shape({1, 1, d}), dev)),
+          out(make_zeros(ttnn::Shape({batch_, seq_, d}), dev)),
+          d_out(make_zeros(ttnn::Shape({batch_, seq_, d}), dev)),
+          x_norm(make_zeros(ttnn::Shape({batch_, seq_, d}), dev)),
+          rstd(make_zeros(ttnn::Shape({batch_, seq_, 1}), dev)),
+          batch(batch_),
+          seq(seq_),
+          dim(d),
+          eps(epsilon) {}
+
+    Value* forward(Graph& g, Value* x) {
+#ifdef TRACY_ENABLE
+        ZoneScopedN("RMSNorm_forward");
+#endif
+        auto* gam = g.leaf(&gamma, &d_gamma, true);
+        auto* bet = g.leaf(&beta, &d_beta, true);
+
+        auto compute_cfg = get_fp32_acc_compute_config();
+        out = ttnn::rms_norm(*x->data, eps, gamma, beta, std::nullopt, std::nullopt, std::nullopt, compute_cfg);
+
+        // Compute rstd and x_norm for backward
+        auto mean_sq = ttnn::mean(ttnn::multiply(*x->data, *x->data), 2, true, std::nullopt, compute_cfg);
+        rstd = ttnn::rsqrt(ttnn::add(mean_sq, eps), false);
+        auto rstd_broadcast = ttnn::repeat(rstd, ttnn::Shape({1, 1, dim}));
+        x_norm = ttnn::multiply(*x->data, rstd_broadcast);
+
+        auto* v = g.node(&out, &d_out);
+        v->parents = {x, gam, bet};
+
+        v->backward_fn = [x, gam, bet, this, v]() {
+            if (!v->grad) return;
+            const auto& dout = *v->grad;
+
+            // d_beta = sum(dout, dims=[0,1])
+            if (bet->requires_grad) {
+                auto sum0 = ttnn::sum(dout, 0, true);
+                bet->accumulate_grad(ttnn::sum(sum0, 1, true));
+            }
+
+            // d_gamma = sum(dout * x_norm, dims=[0,1])
+            if (gam->requires_grad) {
+                auto d_out_x_norm = ttnn::multiply(dout, x_norm);
+                auto sum0_g = ttnn::sum(d_out_x_norm, 0, true);
+                gam->accumulate_grad(ttnn::sum(sum0_g, 1, true));
+            }
+
+            // d_x = (dout * gamma) * rstd - x * rstd^3 * mean((dout*gamma) * x)
+            if (x->requires_grad) {
+                auto d_x_norm = ttnn::multiply(dout, gamma);
+                auto mean_gx = ttnn::mean(ttnn::multiply(d_x_norm, *x->data), 2, true, std::nullopt,
+                                          get_fp32_acc_compute_config());
+                auto mean_gx_broadcast = ttnn::repeat(mean_gx, ttnn::Shape({1, 1, dim}));
+
+                auto rstd_broadcast = ttnn::repeat(rstd, ttnn::Shape({1, 1, dim}));
+                auto rstd_sq = ttnn::multiply(rstd_broadcast, rstd_broadcast);
+                auto rstd_cub = ttnn::multiply(rstd_sq, rstd_broadcast);
+
+                auto term1 = ttnn::multiply(d_x_norm, rstd_broadcast);
+                auto term2 = ttnn::multiply(ttnn::multiply(*x->data, rstd_cub), mean_gx_broadcast);
+                x->accumulate_grad(ttnn::subtract(term1, term2));
+            }
+        };
+
+        return v;
+    }
+
+    Tensor* execute_forward(const Tensor& x) {
+        auto compute_cfg = get_fp32_acc_compute_config();
+        out = ttnn::rms_norm(x, eps, gamma, beta, std::nullopt, std::nullopt, std::nullopt, compute_cfg);
+
+        auto mean_sq = ttnn::mean(ttnn::multiply(x, x), 2, true, std::nullopt, compute_cfg);
+        rstd = ttnn::rsqrt(ttnn::add(mean_sq, eps), false);
+        auto rstd_broadcast = ttnn::repeat(rstd, ttnn::Shape({1, 1, dim}));
+        x_norm = ttnn::multiply(x, rstd_broadcast);
+        return &out;
+    }
+
+    void sgd_step(float lr, float momentum = 0.0f, float weight_decay = 0.0f) {
+        if (momentum > 0.0f) {
             v_gamma = ttnn::add(ttnn::multiply(v_gamma, momentum), d_gamma);
             v_beta = ttnn::add(ttnn::multiply(v_beta, momentum), d_beta);
             gamma = ttnn::subtract(gamma, ttnn::multiply(v_gamma, lr));

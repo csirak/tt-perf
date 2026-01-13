@@ -143,6 +143,7 @@ struct PersistentTransformerLayer {
 
             // d_attn = d_out_heads @ V.T
             auto d_attn = matmul_fp32_acc(d_out_heads, v_heads, false, true);
+            d_attn_weights = d_attn;
 
             // d_V = attn_weights.T @ d_out_heads
             if (v_v->requires_grad) {
@@ -154,6 +155,7 @@ struct PersistentTransformerLayer {
             auto dy_y = ttnn::multiply(d_attn, attn_weights);
             auto sum_dy_y = ttnn::sum(dy_y, -1, true, std::nullopt, get_fp32_acc_compute_config());
             auto d_scores = ttnn::multiply(attn_weights, ttnn::subtract(d_attn, sum_dy_y));
+            d_attn_scores = d_scores;
             auto d_scores_scaled = ttnn::multiply(d_scores, scale);
 
             // d_Q = d_scores_scaled @ K
@@ -338,6 +340,7 @@ struct PersistentTransformerLayerLN {
 
             auto d_out_heads = split_heads(dout, batch, seq, heads, head_dim);
             auto d_attn = matmul_fp32_acc(d_out_heads, v_heads, false, true);
+            d_attn_weights = d_attn;
             if (v_v->requires_grad) {
                 auto d_v_heads = matmul_fp32_acc(attn_weights, d_out_heads, true, false);
                 v_v->accumulate_grad(merge_heads(d_v_heads, batch, seq, heads, head_dim));
@@ -346,6 +349,7 @@ struct PersistentTransformerLayerLN {
             auto dy_y = ttnn::multiply(d_attn, attn_weights);
             auto sum_dy_y = ttnn::sum(dy_y, -1, true, std::nullopt, get_fp32_acc_compute_config());
             auto d_scores = ttnn::multiply(attn_weights, ttnn::subtract(d_attn, sum_dy_y));
+            d_attn_scores = d_scores;
             auto d_scores_scaled = ttnn::multiply(d_scores, scale);
 
             if (q_v->requires_grad) {
@@ -416,6 +420,177 @@ struct PersistentTransformerLayerLN {
         ADAM_REGISTER_LINEAR3D(adam, wv, dev);
         ADAM_REGISTER_LINEAR3D(adam, wo, dev);
         // FFN
+        ADAM_REGISTER_LINEAR3D(adam, ffn.w1, dev);
+        ADAM_REGISTER_LINEAR3D(adam, ffn.w2, dev);
+    }
+};
+
+// =============================================================================
+// PersistentTransformerLayerRMS: Transformer layer with RMSNorm (BF16)
+// =============================================================================
+struct PersistentTransformerLayerRMS {
+    RMSNorm ln1;
+    RMSNorm ln2;
+    Linear3D wq, wk, wv, wo;
+    FFN ffn;
+
+    float scale;
+    uint32_t batch, seq, dim, heads, head_dim;
+
+    Tensor q_proj, k_proj, v_proj;
+    Tensor d_q_proj, d_k_proj, d_v_proj;
+    Tensor q_heads, k_heads, v_heads;
+    Tensor attn_scores, d_attn_scores;
+    Tensor attn_weights, d_attn_weights;
+    Tensor attn_out_heads;
+    Tensor attn_out, d_attn_out;
+    Tensor attn_proj, d_attn_proj;
+    Tensor residual1, d_residual1;
+    Tensor ffn_out, d_ffn_out;
+    Tensor output, d_output;
+
+    Tensor causal_mask;
+
+    PersistentTransformerLayerRMS(uint32_t b, uint32_t s, uint32_t d, uint32_t h,
+                                  uint32_t ffn_mult, float init, MeshDevice& dev,
+                                  float ln_eps)
+        : ln1(b, s, d, ln_eps, dev),
+          ln2(b, s, d, ln_eps, dev),
+          wq(b, s, d, d, init, dev),
+          wk(b, s, d, d, init, dev),
+          wv(b, s, d, d, init, dev),
+          wo(b, s, d, d, init, dev),
+          ffn(b, s, d, d * ffn_mult, init, dev),
+          scale(attn_scale(d, h)),
+          batch(b), seq(s), dim(d), heads(h), head_dim(d / h),
+          q_proj(make_zeros(ttnn::Shape({b, s, d}), dev)),
+          k_proj(make_zeros(ttnn::Shape({b, s, d}), dev)),
+          v_proj(make_zeros(ttnn::Shape({b, s, d}), dev)),
+          d_q_proj(make_zeros(ttnn::Shape({b, s, d}), dev)),
+          d_k_proj(make_zeros(ttnn::Shape({b, s, d}), dev)),
+          d_v_proj(make_zeros(ttnn::Shape({b, s, d}), dev)),
+          q_heads(make_zeros(ttnn::Shape({b, h, s, head_dim}), dev)),
+          k_heads(make_zeros(ttnn::Shape({b, h, s, head_dim}), dev)),
+          v_heads(make_zeros(ttnn::Shape({b, h, s, head_dim}), dev)),
+          attn_scores(make_zeros(ttnn::Shape({b, h, s, s}), dev)),
+          d_attn_scores(make_zeros(ttnn::Shape({b, h, s, s}), dev)),
+          attn_weights(make_zeros(ttnn::Shape({b, h, s, s}), dev)),
+          d_attn_weights(make_zeros(ttnn::Shape({b, h, s, s}), dev)),
+          attn_out_heads(make_zeros(ttnn::Shape({b, h, s, head_dim}), dev)),
+          attn_out(make_zeros(ttnn::Shape({b, s, d}), dev)),
+          d_attn_out(make_zeros(ttnn::Shape({b, s, d}), dev)),
+          attn_proj(make_zeros(ttnn::Shape({b, s, d}), dev)),
+          d_attn_proj(make_zeros(ttnn::Shape({b, s, d}), dev)),
+          residual1(make_zeros(ttnn::Shape({b, s, d}), dev)),
+          d_residual1(make_zeros(ttnn::Shape({b, s, d}), dev)),
+          ffn_out(make_zeros(ttnn::Shape({b, s, d}), dev)),
+          d_ffn_out(make_zeros(ttnn::Shape({b, s, d}), dev)),
+          output(make_zeros(ttnn::Shape({b, s, d}), dev)),
+          d_output(make_zeros(ttnn::Shape({b, s, d}), dev)),
+          causal_mask(PersistentTransformerLayer::create_causal_mask(s, dev)) {}
+
+    Value* forward(Graph& g, Value* x) {
+#ifdef TRACY_ENABLE
+        ZoneScopedN("TransformerLayerRMS_forward");
+#endif
+        auto* ln1_v = ln1.forward(g, x);
+        auto* q_v = wq.forward(g, ln1_v);
+        auto* k_v = wk.forward(g, ln1_v);
+        auto* v_v = wv.forward(g, ln1_v);
+
+        q_heads = split_heads(*q_v->data, batch, seq, heads, head_dim);
+        k_heads = split_heads(*k_v->data, batch, seq, heads, head_dim);
+        v_heads = split_heads(*v_v->data, batch, seq, heads, head_dim);
+
+        attn_scores = ttnn::multiply(matmul_fp32_acc(q_heads, k_heads, false, true), scale);
+        auto scores_masked = ttnn::add(attn_scores, causal_mask);
+        attn_weights = ttnn::softmax(scores_masked, -1, std::nullopt, get_softmax_compute_config(), true);
+        attn_out_heads = matmul_fp32_acc(attn_weights, v_heads);
+        attn_out = merge_heads(attn_out_heads, batch, seq, heads, head_dim);
+
+        auto* attn_v = g.node(&attn_out, &d_attn_out);
+        attn_v->parents = {q_v, k_v, v_v};
+
+        attn_v->backward_fn = [q_v, k_v, v_v, this, attn_v]() {
+            if (!attn_v->grad) return;
+            const auto& dout = *attn_v->grad;
+
+            auto d_out_heads = split_heads(dout, batch, seq, heads, head_dim);
+            auto d_attn = matmul_fp32_acc(d_out_heads, v_heads, false, true);
+            if (v_v->requires_grad) {
+                auto d_v_heads = matmul_fp32_acc(attn_weights, d_out_heads, true, false);
+                v_v->accumulate_grad(merge_heads(d_v_heads, batch, seq, heads, head_dim));
+            }
+
+            auto dy_y = ttnn::multiply(d_attn, attn_weights);
+            auto sum_dy_y = ttnn::sum(dy_y, -1, true, std::nullopt, get_fp32_acc_compute_config());
+            auto d_scores = ttnn::multiply(attn_weights, ttnn::subtract(d_attn, sum_dy_y));
+            auto d_scores_scaled = ttnn::multiply(d_scores, scale);
+
+            if (q_v->requires_grad) {
+                auto d_q_heads = matmul_fp32_acc(d_scores_scaled, k_heads);
+                q_v->accumulate_grad(merge_heads(d_q_heads, batch, seq, heads, head_dim));
+            }
+            if (k_v->requires_grad) {
+                auto d_k_heads = matmul_fp32_acc(d_scores_scaled, q_heads, true, false);
+                k_v->accumulate_grad(merge_heads(d_k_heads, batch, seq, heads, head_dim));
+            }
+        };
+
+        auto* attn_proj_v = wo.forward(g, attn_v);
+        auto* res1_v = add(g, x, attn_proj_v, &residual1, &d_residual1);
+        auto* ln2_v = ln2.forward(g, res1_v);
+        auto* ffn_v = ffn.forward(g, ln2_v);
+        return add(g, res1_v, ffn_v, &output, &d_output);
+    }
+
+    Tensor* execute_forward(const Tensor& x) {
+        ln1.execute_forward(x);
+
+        wq.out = ttnn::add(ttnn::matmul(ln1.out, wq.weight, false, true), wq.bias);
+        wk.out = ttnn::add(ttnn::matmul(ln1.out, wk.weight, false, true), wk.bias);
+        wv.out = ttnn::add(ttnn::matmul(ln1.out, wv.weight, false, true), wv.bias);
+
+        q_heads = split_heads(wq.out, batch, seq, heads, head_dim);
+        k_heads = split_heads(wk.out, batch, seq, heads, head_dim);
+        v_heads = split_heads(wv.out, batch, seq, heads, head_dim);
+
+        attn_scores = ttnn::multiply(matmul_fp32_acc(q_heads, k_heads, false, true), scale);
+        auto scores_masked = ttnn::add(attn_scores, causal_mask);
+        attn_weights = ttnn::softmax(scores_masked, -1, std::nullopt, get_softmax_compute_config(), true);
+
+        attn_out_heads = matmul_fp32_acc(attn_weights, v_heads);
+        attn_out = merge_heads(attn_out_heads, batch, seq, heads, head_dim);
+        wo.out = ttnn::add(ttnn::matmul(attn_out, wo.weight, false, true), wo.bias);
+
+        residual1 = ttnn::add(x, wo.out);
+        ln2.execute_forward(residual1);
+
+        ffn.w1.out = ttnn::add(ttnn::matmul(ln2.out, ffn.w1.weight, false, true), ffn.w1.bias);
+        ffn.gelu_out = gelu_forward_tensor(ffn.w1.out);
+        ffn.w2.out = ttnn::add(ttnn::matmul(ffn.gelu_out, ffn.w2.weight, false, true), ffn.w2.bias);
+
+        output = ttnn::add(residual1, ffn.w2.out);
+        return &output;
+    }
+
+    void sgd_step(float lr, float momentum = 0.0f, float weight_decay = 0.0f) {
+        ln1.sgd_step(lr, momentum, weight_decay);
+        ln2.sgd_step(lr, momentum, weight_decay);
+        wq.sgd_step(lr, momentum, weight_decay);
+        wk.sgd_step(lr, momentum, weight_decay);
+        wv.sgd_step(lr, momentum, weight_decay);
+        wo.sgd_step(lr, momentum, weight_decay);
+        ffn.sgd_step(lr, momentum, weight_decay);
+    }
+
+    void register_adam(Adam& adam, MeshDevice& dev) {
+        ADAM_REGISTER_LAYERNORM(adam, ln1, dev);  // RMSNorm params (same shapes, no wd)
+        ADAM_REGISTER_LAYERNORM(adam, ln2, dev);
+        ADAM_REGISTER_LINEAR3D(adam, wq, dev);
+        ADAM_REGISTER_LINEAR3D(adam, wk, dev);
+        ADAM_REGISTER_LINEAR3D(adam, wv, dev);
+        ADAM_REGISTER_LINEAR3D(adam, wo, dev);
         ADAM_REGISTER_LINEAR3D(adam, ffn.w1, dev);
         ADAM_REGISTER_LINEAR3D(adam, ffn.w2, dev);
     }

@@ -1,0 +1,5 @@
+idx	op	type	inputs	input_shapes	input_origins	input_dtypes	output	output_shape	output_origin	output_dtype	opts
+0	add	binary	/home/howard/ttnn-perf/tensordiff/outputs/oplog/0000_add_in0.bin,/home/howard/ttnn-perf/tensordiff/outputs/oplog/0000_add_in1.bin	32x32,32x32	ttnn,ttnn	bf16,bf16	/home/howard/ttnn-perf/tensordiff/outputs/oplog/0000_add_out.bin	32x32	ttnn	bf16	
+1	sub	binary	/home/howard/ttnn-perf/tensordiff/outputs/oplog/0001_sub_in0.bin,/home/howard/ttnn-perf/tensordiff/outputs/oplog/0001_sub_in1.bin	32x32,32x32	ttnn,ttnn	bf16,bf16	/home/howard/ttnn-perf/tensordiff/outputs/oplog/0001_sub_out.bin	32x32	ttnn	bf16	
+2	mm	binary	/home/howard/ttnn-perf/tensordiff/outputs/oplog/0002_mm_in0.bin,/home/howard/ttnn-perf/tensordiff/outputs/oplog/0002_mm_in1.bin	32x32,32x32	ttnn,ttnn	bf16,bf16	/home/howard/ttnn-perf/tensordiff/outputs/oplog/0002_mm_out.bin	32x32	ttnn	bf16	
+3	mm	binary	/home/howard/ttnn-perf/tensordiff/outputs/oplog/0003_mm_in0.bin,/home/howard/ttnn-perf/tensordiff/outputs/oplog/0003_mm_in1.bin	32x32,32x32	ttnn,ttnn	bf16,bf16	/home/howard/ttnn-perf/tensordiff/outputs/oplog/0003_mm_out.bin	32x32	ttnn	bf16	math_fidelity=2,approx=0,fp32_acc=1,packer_l1=1

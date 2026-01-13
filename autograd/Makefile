@@ -1125,54 +1125,245 @@ bench-gpt2-fwd-back-mxp-profile: bench-gpt2-fwd-back-mxp-sync bench-gpt2-fwd-bac
 	@echo "Tracy trace: $(PROFILER_LOGS)/gpt2_mxp.tracy"
 	@echo "CSV output:  $(PROFILER_LOGS)/gpt2_mxp.csv"
 
-# === GPT-2 MXP TensorGroup Benchmark ===
-# Tests PersistentGPT2MXP with batched typecast via TypecastCache
-# Compares BFP8 (inline typecast) vs MXP (batched typecast)
-# Usage: BENCH_LAYERS=6 make bench-gpt2-mxp-tgroup
-
-bench-gpt2-mxp-tgroup: bench-gpt2-mxp-tgroup-sync bench-gpt2-mxp-tgroup-build bench-gpt2-mxp-tgroup-run
-
-bench-gpt2-mxp-tgroup-sync:
-	mkdir -p $(AUTOGRAD_DIR)/autograd
-	cp -r nn $(AUTOGRAD_DIR)/autograd/
-	cp ops.hpp tensor_group.hpp value.hpp nn.hpp $(AUTOGRAD_DIR)/autograd/
-	cp common.hpp $(AUTOGRAD_DIR)/
-	cp ../bench/autograd/bench_gpt2_fwd_back_mxp_tgroup.cpp $(AUTOGRAD_DIR)/main.cpp
-
-bench-gpt2-mxp-tgroup-build:
-	cd $(BUILD_DIR) && ninja example_autograd
-
-bench-gpt2-mxp-tgroup-run:
-	cd $(TT_METAL) && ./build_Release/ttnn/examples/example_autograd
-
-# Profile MXP TensorGroup with Tracy
-
-bench-gpt2-mxp-tgroup-profile: bench-gpt2-mxp-tgroup-sync bench-gpt2-mxp-tgroup-build
-	@echo "=== Tracy Profiling: GPT-2 MXP TensorGroup ==="
-	@mkdir -p $(PROFILER_LOGS)
-	@echo "Starting Tracy capture on port $(TRACY_PORT)..."
-	@$(CAPTURE_BIN) -o $(PROFILER_LOGS)/gpt2_mxp_tgroup.tracy -f -p $(TRACY_PORT) & \
-	CAPTURE_PID=$$!; \
-	sleep 2; \
-	echo "Running MXP TensorGroup benchmark with Tracy profiling..."; \
-	cd $(TT_METAL) && TT_METAL_DEVICE_PROFILER=1 TT_METAL_DEVICE_PROFILER_SYNC=1 TRACY_PORT=$(TRACY_PORT) \
-		./build_Release/ttnn/examples/example_autograd; \
-	sleep 1; \
-	kill $$CAPTURE_PID 2>/dev/null || true; \
-	wait $$CAPTURE_PID 2>/dev/null || true
-	@echo "Exporting to CSV..."
-	@$(CSVEXPORT_BIN) -u $(PROFILER_LOGS)/gpt2_mxp_tgroup.tracy \
-		> $(PROFILER_LOGS)/gpt2_mxp_tgroup.csv 2>/dev/null || true
-	@echo ""
-	@echo "=== Profiling Complete ==="
-	@echo "Tracy trace: $(PROFILER_LOGS)/gpt2_mxp_tgroup.tracy"
-	@echo "CSV output:  $(PROFILER_LOGS)/gpt2_mxp_tgroup.csv"
-
 # === PyTorch Benchmarks on adam (CUDA) ===
 # Run via SSH from howard to adam
 ADAM := adam
 ADAM_DIR := ~/ttnn-perf
 CUDA_RESULTS := ../bench/reports/cuda
+
+# === tensordiff: TTNN↔Torch Tensor Comparison ===
+# Usage: make tensordiff-compare
+
+tensordiff-compare: tensordiff-compare-sync tensordiff-compare-build tensordiff-compare-run
+
+tensordiff-compare-sync:
+	mkdir -p $(AUTOGRAD_DIR)/tensordiff
+	cp -r ../tensordiff/core $(AUTOGRAD_DIR)/tensordiff/
+	cp ../tensordiff/compare_ttnn_torch.cpp $(AUTOGRAD_DIR)/main.cpp
+
+tensordiff-compare-build:
+	cd $(BUILD_DIR) && ninja example_autograd
+
+tensordiff-compare-run:
+	cd $(TT_METAL) && TENSORDIFF_OUT_DIR=$(HOME)/ttnn-perf/tensordiff/outputs/ttnn \
+		./build_Release/ttnn/examples/example_autograd
+
+# === tensordiff: BF16 matmul diff (TTNN) ===
+# Usage: make tensordiff-matmul
+
+tensordiff-matmul: tensordiff-matmul-sync tensordiff-matmul-build tensordiff-matmul-run
+
+tensordiff-matmul-sync:
+	mkdir -p $(AUTOGRAD_DIR)/tensordiff
+	cp -r ../tensordiff/core $(AUTOGRAD_DIR)/tensordiff/
+	cp ../tensordiff/matmul_bf16_diff.cpp $(AUTOGRAD_DIR)/main.cpp
+
+tensordiff-matmul-build:
+	cd $(BUILD_DIR) && ninja example_autograd
+
+tensordiff-matmul-run:
+	cd $(TT_METAL) && TENSORDIFF_OUT_DIR=$(HOME)/ttnn-perf/tensordiff/outputs/matmul \
+		./build_Release/ttnn/examples/example_autograd
+
+# === tensordiff: Torch random init + TTNN matmul from TDF1 ===
+# Usage: make tensordiff-matmul-torch
+
+tensordiff-matmul-torch: tensordiff-matmul-torch-gen tensordiff-matmul-torch-ttnn
+
+tensordiff-matmul-torch-gen: tensordiff-torch-compare-build
+	cd $(TENSORDIFF_BUILD_DIR) && TENSORDIFF_OUT_DIR=$(HOME)/ttnn-perf/tensordiff/outputs/matmul_torch_rand \
+		./tensordiff_torch_random_init
+
+tensordiff-matmul-torch-ttnn: tensordiff-matmul-torch-ttnn-sync tensordiff-matmul-torch-ttnn-build tensordiff-matmul-torch-ttnn-run
+
+tensordiff-matmul-torch-ttnn-sync:
+	mkdir -p $(AUTOGRAD_DIR)/tensordiff
+	cp -r ../tensordiff/core $(AUTOGRAD_DIR)/tensordiff/
+	cp ../tensordiff/matmul_from_tdf1.cpp $(AUTOGRAD_DIR)/main.cpp
+
+tensordiff-matmul-torch-ttnn-build:
+	cd $(BUILD_DIR) && ninja example_autograd
+
+tensordiff-matmul-torch-ttnn-run:
+	cd $(TT_METAL) && TENSORDIFF_OUT_DIR=$(HOME)/ttnn-perf/tensordiff/outputs/matmul_torch_rand \
+		./build_Release/ttnn/examples/example_autograd
+
+# === tensordiff: LayerNorm (Torch → TTNN) ===
+# Usage: make tensordiff-layernorm
+
+tensordiff-layernorm: tensordiff-layernorm-gen tensordiff-layernorm-ttnn
+
+tensordiff-layernorm-gen: tensordiff-torch-compare-build
+	cd $(TENSORDIFF_BUILD_DIR) && TENSORDIFF_OUT_DIR=$(HOME)/ttnn-perf/tensordiff/outputs/layernorm_torch_rand \
+		./tensordiff_torch_layernorm_init
+
+tensordiff-layernorm-ttnn: tensordiff-layernorm-ttnn-sync tensordiff-layernorm-ttnn-build tensordiff-layernorm-ttnn-run
+
+tensordiff-layernorm-ttnn-sync:
+	mkdir -p $(AUTOGRAD_DIR)/tensordiff
+	cp -r ../tensordiff/core $(AUTOGRAD_DIR)/tensordiff/
+	cp ../tensordiff/layernorm_from_tdf1.cpp $(AUTOGRAD_DIR)/main.cpp
+
+tensordiff-layernorm-ttnn-build:
+	cd $(BUILD_DIR) && ninja example_autograd
+
+tensordiff-layernorm-ttnn-run:
+	cd $(TT_METAL) && TENSORDIFF_OUT_DIR=$(HOME)/ttnn-perf/tensordiff/outputs/layernorm_torch_rand \
+		./build_Release/ttnn/examples/example_autograd
+
+# === tensordiff: Transformer layer (Torch → TTNN) ===
+# Usage: make tensordiff-transformer-layer
+
+tensordiff-transformer-layer: tensordiff-transformer-layer-gen tensordiff-transformer-layer-ttnn
+
+tensordiff-transformer-layer-gen: tensordiff-torch-compare-build
+	cd $(TENSORDIFF_BUILD_DIR) && TENSORDIFF_OUT_DIR=$(HOME)/ttnn-perf/tensordiff/outputs/transformer_layer_torch_rand \
+		./tensordiff_torch_transformer_layer_init
+
+tensordiff-transformer-layer-ttnn: tensordiff-transformer-layer-ttnn-sync tensordiff-transformer-layer-ttnn-build tensordiff-transformer-layer-ttnn-run
+
+tensordiff-transformer-layer-ttnn-sync:
+	mkdir -p $(AUTOGRAD_DIR)/tensordiff
+	cp -r ../tensordiff/core $(AUTOGRAD_DIR)/tensordiff/
+	cp ../tensordiff/transformer_layer_from_tdf1.cpp $(AUTOGRAD_DIR)/main.cpp
+
+tensordiff-transformer-layer-ttnn-build:
+	cd $(BUILD_DIR) && ninja example_autograd
+
+tensordiff-transformer-layer-ttnn-run:
+	cd $(TT_METAL) && TENSORDIFF_OUT_DIR=$(HOME)/ttnn-perf/tensordiff/outputs/transformer_layer_torch_rand \
+		./build_Release/ttnn/examples/example_autograd
+
+# === tensordiff: Transformer layer backward (Torch → TTNN autograd) ===
+# Usage: make tensordiff-transformer-layer-bwd
+
+tensordiff-transformer-layer-bwd: tensordiff-transformer-layer-bwd-gen tensordiff-transformer-layer-bwd-ttnn
+
+tensordiff-transformer-layer-bwd-gen: tensordiff-torch-compare-build
+	cd $(TENSORDIFF_BUILD_DIR) && TENSORDIFF_OUT_DIR=$(HOME)/ttnn-perf/tensordiff/outputs/transformer_layer_bwd_torch_rand \
+		./tensordiff_torch_transformer_layer_backward_init
+
+tensordiff-transformer-layer-bwd-ttnn: tensordiff-transformer-layer-bwd-ttnn-sync tensordiff-transformer-layer-bwd-ttnn-build tensordiff-transformer-layer-bwd-ttnn-run
+
+tensordiff-transformer-layer-bwd-ttnn-sync:
+	mkdir -p $(AUTOGRAD_DIR)/tensordiff
+	mkdir -p $(AUTOGRAD_DIR)/autograd
+	cp -r ../tensordiff/core $(AUTOGRAD_DIR)/tensordiff/
+	cp -r ../autograd/nn $(AUTOGRAD_DIR)/autograd/
+	cp ../autograd/ops.hpp ../autograd/value.hpp ../autograd/tensor_group.hpp $(AUTOGRAD_DIR)/autograd/
+	cp ../tensordiff/transformer_layer_backward_from_tdf1.cpp $(AUTOGRAD_DIR)/main.cpp
+
+tensordiff-transformer-layer-bwd-ttnn-build:
+	cd $(BUILD_DIR) && ninja example_autograd
+
+tensordiff-transformer-layer-bwd-ttnn-run:
+	cd $(TT_METAL) && TENSORDIFF_OUT_DIR=$(HOME)/ttnn-perf/tensordiff/outputs/transformer_layer_bwd_torch_rand \
+		./build_Release/ttnn/examples/example_autograd
+
+# === tensordiff: Softmax backward (binary op) ===
+# Usage: make tensordiff-softmax-bw
+
+tensordiff-softmax-bw: tensordiff-transformer-layer-bwd-gen tensordiff-softmax-bw-ttnn
+
+tensordiff-softmax-bw-ttnn: tensordiff-softmax-bw-ttnn-sync tensordiff-softmax-bw-ttnn-build tensordiff-softmax-bw-ttnn-run
+
+tensordiff-softmax-bw-ttnn-sync:
+	mkdir -p $(AUTOGRAD_DIR)/tensordiff
+	cp -r ../tensordiff/core $(AUTOGRAD_DIR)/tensordiff/
+	cp ../tensordiff/softmax_backward_from_tdf1.cpp $(AUTOGRAD_DIR)/main.cpp
+
+tensordiff-softmax-bw-ttnn-build:
+	cd $(BUILD_DIR) && ninja example_autograd
+
+tensordiff-softmax-bw-ttnn-run:
+	cd $(TT_METAL) && TENSORDIFF_OUT_DIR=$(HOME)/ttnn-perf/tensordiff/outputs/transformer_layer_bwd_torch_rand \
+		./build_Release/ttnn/examples/example_autograd
+
+# === tensordiff: libtorch comparator (CPU) ===
+# Requires libtorch installed at ~/libtorch
+# Usage: make tensordiff-torch-compare
+
+TENSORDIFF_DIR := ../tensordiff
+TENSORDIFF_BUILD_DIR := $(TENSORDIFF_DIR)/build
+
+tensordiff-torch-compare: tensordiff-torch-compare-build tensordiff-torch-compare-run
+
+tensordiff-torch-compare-build:
+	mkdir -p $(TENSORDIFF_BUILD_DIR)
+	cd $(TENSORDIFF_BUILD_DIR) && \
+		TT_METAL_HOME=$(TT_METAL) cmake -DCMAKE_PREFIX_PATH=$(HOME)/libtorch .. && \
+		$(MAKE)
+
+tensordiff-torch-compare-run:
+	cd $(TENSORDIFF_BUILD_DIR) && \
+		TT_METAL_HOME=$(TT_METAL) LD_LIBRARY_PATH=$(HOME)/libtorch/lib:$$LD_LIBRARY_PATH \
+		./tensordiff_torch_compare --dir $(HOME)/ttnn-perf/tensordiff/outputs/ttnn
+
+# === tensordiff: tensor ops test (TTNN) ===
+# Usage: make tensordiff-ops-test
+
+tensordiff-ops-test: tensordiff-ops-test-sync tensordiff-ops-test-build tensordiff-ops-test-run
+
+tensordiff-ops-test-sync:
+	mkdir -p $(AUTOGRAD_DIR)/tensordiff
+	cp -r ../tensordiff/core $(AUTOGRAD_DIR)/tensordiff/
+	cp ../tensordiff/ttnn_tensor.hpp $(AUTOGRAD_DIR)/tensordiff/
+	cp ../tensordiff/tests/tensor_ops_test.cpp $(AUTOGRAD_DIR)/main.cpp
+
+tensordiff-ops-test-build:
+	cd $(BUILD_DIR) && ninja example_autograd
+
+tensordiff-ops-test-run:
+	cd $(TT_METAL) && ./build_Release/ttnn/examples/example_autograd
+
+# === tensordiff: BaseTensor dispatch test (TTNN) ===
+# Usage: make tensordiff-dispatch-test
+
+tensordiff-dispatch-test: tensordiff-dispatch-test-sync tensordiff-dispatch-test-build tensordiff-dispatch-test-run
+
+tensordiff-dispatch-test-sync:
+	mkdir -p $(AUTOGRAD_DIR)/tensordiff
+	cp -r ../tensordiff/core $(AUTOGRAD_DIR)/tensordiff/
+	cp ../tensordiff/ttnn_tensor.hpp $(AUTOGRAD_DIR)/tensordiff/
+	cp ../tensordiff/tests/base_tensor_dispatch_test.cpp $(AUTOGRAD_DIR)/main.cpp
+
+tensordiff-dispatch-test-build:
+	cd $(BUILD_DIR) && ninja example_autograd
+
+tensordiff-dispatch-test-run:
+	cd $(TT_METAL) && ./build_Release/ttnn/examples/example_autograd
+
+# === tensordiff: tensor ops test (Torch/libtorch) ===
+# Usage: make tensordiff-ops-test-torch
+
+tensordiff-ops-test-torch: tensordiff-ops-test-torch-build tensordiff-ops-test-torch-run
+
+tensordiff-ops-test-torch-build:
+	mkdir -p $(TENSORDIFF_BUILD_DIR)
+	cd $(TENSORDIFF_BUILD_DIR) && \
+		TT_METAL_HOME=$(TT_METAL) cmake -DCMAKE_PREFIX_PATH=$(HOME)/libtorch .. && \
+		$(MAKE) tensordiff_tensor_ops_test
+
+tensordiff-ops-test-torch-run:
+	cd $(TENSORDIFF_BUILD_DIR) && \
+		TT_METAL_HOME=$(TT_METAL) LD_LIBRARY_PATH=$(HOME)/libtorch/lib:$$LD_LIBRARY_PATH \
+		./tensordiff_tensor_ops_test
+
+# === tensordiff: BaseTensor dispatch test (Torch/libtorch) ===
+# Usage: make tensordiff-dispatch-test-torch
+
+tensordiff-dispatch-test-torch: tensordiff-dispatch-test-torch-build tensordiff-dispatch-test-torch-run
+
+tensordiff-dispatch-test-torch-build:
+	mkdir -p $(TENSORDIFF_BUILD_DIR)
+	cd $(TENSORDIFF_BUILD_DIR) && \
+		TT_METAL_HOME=$(TT_METAL) cmake -DCMAKE_PREFIX_PATH=$(HOME)/libtorch .. && \
+		$(MAKE) tensordiff_tensor_dispatch_test
+
+tensordiff-dispatch-test-torch-run:
+	cd $(TENSORDIFF_BUILD_DIR) && \
+		TT_METAL_HOME=$(TT_METAL) LD_LIBRARY_PATH=$(HOME)/libtorch/lib:$$LD_LIBRARY_PATH \
+		./tensordiff_tensor_dispatch_test
 
 
 # Run GPT-2 PyTorch on adam (CUDA), save results to howard
@@ -1292,49 +1483,6 @@ verify-attention-sdpa-sync:
 verify-attention-sdpa-run:
 	@echo "=== Running SDPA vs Manual comparison ==="
 	cd ~/ttnn-perf && TT_METAL_HOME=~/tt-metal TT_METAL_RUNTIME_ROOT=~/tt-metal ~/tt-metal/build_Release/ttnn/examples/example_autograd
-
-# === GPT-2 MXP2 Benchmark: Batched Weight Typecast ===
-# Tests PersistentGPT2MXP2 with batched weight typecast after SGD
-# Compares MXP (inline weight typecast) vs MXP2 (batched weight typecast)
-# Usage: BENCH_LAYERS=6 make bench-gpt2-mxp2
-
-bench-gpt2-mxp2: bench-gpt2-mxp2-sync bench-gpt2-mxp2-build bench-gpt2-mxp2-run
-
-bench-gpt2-mxp2-sync:
-	mkdir -p $(AUTOGRAD_DIR)/autograd
-	cp -r nn $(AUTOGRAD_DIR)/autograd/
-	cp ops.hpp tensor_group.hpp value.hpp nn.hpp $(AUTOGRAD_DIR)/autograd/
-	cp common.hpp $(AUTOGRAD_DIR)/
-	cp ../bench/autograd/bench_gpt2_mxp2.cpp $(AUTOGRAD_DIR)/main.cpp
-
-bench-gpt2-mxp2-build:
-	cd $(BUILD_DIR) && ninja example_autograd
-
-bench-gpt2-mxp2-run:
-	cd $(TT_METAL) && ./build_Release/ttnn/examples/example_autograd
-
-# Profile MXP2 with Tracy
-
-bench-gpt2-mxp2-profile: bench-gpt2-mxp2-sync bench-gpt2-mxp2-build
-	@echo "=== Tracy Profiling: GPT-2 MXP2 (Batched Weight Typecast) ==="
-	@mkdir -p $(PROFILER_LOGS)
-	@echo "Starting Tracy capture on port $(TRACY_PORT)..."
-	@$(CAPTURE_BIN) -o $(PROFILER_LOGS)/gpt2_mxp2.tracy -f -p $(TRACY_PORT) & \
-	CAPTURE_PID=$$!; \
-	sleep 2; \
-	echo "Running MXP2 benchmark with Tracy profiling..."; \
-	cd $(TT_METAL) && TT_METAL_DEVICE_PROFILER=$(TT_METAL_DEVICE_PROFILER) TT_METAL_DEVICE_PROFILER_SYNC=$(TT_METAL_DEVICE_PROFILER_SYNC) TRACY_PORT=$(TRACY_PORT) \
-		./build_Release/ttnn/examples/example_autograd; \
-	sleep 1; \
-	kill $$CAPTURE_PID 2>/dev/null || true; \
-	wait $$CAPTURE_PID 2>/dev/null || true
-	@echo "Exporting to CSV..."
-	@$(CSVEXPORT_BIN) -u $(PROFILER_LOGS)/gpt2_mxp2.tracy \
-		> $(PROFILER_LOGS)/gpt2_mxp2.csv 2>/dev/null || true
-	@echo ""
-	@echo "=== Profiling Complete ==="
-	@echo "Tracy trace: $(PROFILER_LOGS)/gpt2_mxp2.tracy"
-	@echo "CSV output:  $(PROFILER_LOGS)/gpt2_mxp2.csv"
 
 # === Grokking: Modular Division Experiment ===
 # Usage: GROK_CONFIG=~/ttnn-perf/experiments/grok/default.yaml make grok-train

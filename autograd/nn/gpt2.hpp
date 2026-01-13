@@ -4,6 +4,7 @@
 #include "adam.hpp"
 
 #include <stdexcept>
+#include <type_traits>
 
 namespace static_autograd {
 
@@ -213,16 +214,51 @@ struct PersistentGPT2 {
 };
 
 // =============================================================================
-// PersistentGrokGPT2: GPT-2 with token + position embeddings (BF16)
-// Builds graph once and reuses it with manual forward execution.
+// PersistentGrokGPT2T: GPT-2 with token + position embeddings (BF16)
+// Single template covers DyT, LayerNorm, and RMSNorm variants.
 // =============================================================================
-template<size_t N>
-struct PersistentGrokGPT2 {
+enum class NormKind { DyT, LayerNorm, RMSNorm };
+
+struct EmptyFinalNorm {};
+
+template <NormKind K>
+struct NormTraits;
+
+template <>
+struct NormTraits<NormKind::DyT> {
+    using Layer = PersistentTransformerLayer;
+    using FinalNorm = EmptyFinalNorm;
+    static constexpr bool kHasFinal = false;
+    static constexpr bool kNeedsEps = false;
+};
+
+template <>
+struct NormTraits<NormKind::LayerNorm> {
+    using Layer = PersistentTransformerLayerLN;
+    using FinalNorm = LayerNorm;
+    static constexpr bool kHasFinal = true;
+    static constexpr bool kNeedsEps = true;
+};
+
+template <>
+struct NormTraits<NormKind::RMSNorm> {
+    using Layer = PersistentTransformerLayerRMS;
+    using FinalNorm = RMSNorm;
+    static constexpr bool kHasFinal = true;
+    static constexpr bool kNeedsEps = true;
+};
+
+template <size_t N, NormKind K>
+struct PersistentGrokGPT2T {
     static_assert(N >= 1, "Must have at least 1 layer");
+
+    using LayerT = typename NormTraits<K>::Layer;
+    using FinalNormT = typename NormTraits<K>::FinalNorm;
 
     Embedding tok;
     Embedding pos;
-    std::vector<PersistentTransformerLayer> layers;
+    std::vector<LayerT> layers;
+    FinalNormT ln_final;
     Linear3D output_proj;
 
     Tensor token_indices;
@@ -238,25 +274,47 @@ struct PersistentGrokGPT2 {
 
     uint32_t batch, seq, dim, vocab;
     float lr;
+    float ln_eps;
     MeshDevice* device;
 
-    PersistentGrokGPT2(uint32_t b, uint32_t s, uint32_t d, uint32_t h, uint32_t ffn_mult,
-                       uint32_t v, float learning_rate, MeshDevice& dev)
-        // PyTorch-like initialization:
-        // - Embedding: N(0, 1) → std=1.0
-        // - Linear: kaiming uniform → std ≈ sqrt(1/fan_in)
-        : tok(v, d, b, s, 1.0f, dev),  // N(0,1) for embedding
-          pos(s, d, b, s, 1.0f, dev),  // N(0,1) for embedding
-          output_proj(b, s, d, v, std::sqrt(1.0f / d), dev),  // kaiming for linear
+    template <NormKind KK = K, std::enable_if_t<NormTraits<KK>::kNeedsEps, int> = 0>
+    PersistentGrokGPT2T(uint32_t b, uint32_t s, uint32_t d, uint32_t h, uint32_t ffn_mult,
+                        uint32_t v, float learning_rate, float ln_eps_, MeshDevice& dev)
+        : tok(v, d, b, s, 1.0f, dev),
+          pos(s, d, b, s, 1.0f, dev),
+          ln_final(b, s, d, ln_eps_, dev),
+          output_proj(b, s, d, v, std::sqrt(1.0f / d), dev),
           token_indices(make_indices(std::vector<uint32_t>(b * s, 0), ttnn::Shape({b, s}), dev)),
           pos_indices(make_indices(build_pos_indices(b, s), ttnn::Shape({b, s}), dev)),
           tok_plus_pos(make_zeros(ttnn::Shape({b, s, d}), dev)),
           d_tok_plus_pos(make_zeros(ttnn::Shape({b, s, d}), dev)),
           batch(b), seq(s), dim(d), vocab(v),
           lr(learning_rate),
+          ln_eps(ln_eps_),
           device(&dev) {
         layers.reserve(N);
-        float layer_init = std::sqrt(1.0f / d);  // kaiming for linear layers
+        float layer_init = std::sqrt(1.0f / d);
+        for (size_t i = 0; i < N; ++i) {
+            layers.emplace_back(b, s, d, h, ffn_mult, layer_init, dev, ln_eps_);
+        }
+    }
+
+    template <NormKind KK = K, std::enable_if_t<!NormTraits<KK>::kNeedsEps, int> = 0>
+    PersistentGrokGPT2T(uint32_t b, uint32_t s, uint32_t d, uint32_t h, uint32_t ffn_mult,
+                        uint32_t v, float learning_rate, MeshDevice& dev)
+        : tok(v, d, b, s, 1.0f, dev),
+          pos(s, d, b, s, 1.0f, dev),
+          output_proj(b, s, d, v, std::sqrt(1.0f / d), dev),
+          token_indices(make_indices(std::vector<uint32_t>(b * s, 0), ttnn::Shape({b, s}), dev)),
+          pos_indices(make_indices(build_pos_indices(b, s), ttnn::Shape({b, s}), dev)),
+          tok_plus_pos(make_zeros(ttnn::Shape({b, s, d}), dev)),
+          d_tok_plus_pos(make_zeros(ttnn::Shape({b, s, d}), dev)),
+          batch(b), seq(s), dim(d), vocab(v),
+          lr(learning_rate),
+          ln_eps(0.0f),
+          device(&dev) {
+        layers.reserve(N);
+        float layer_init = std::sqrt(1.0f / d);
         for (size_t i = 0; i < N; ++i) {
             layers.emplace_back(b, s, d, h, ffn_mult, layer_init, dev);
         }
@@ -292,6 +350,10 @@ struct PersistentGrokGPT2 {
             h = layers[i].forward(graph, h);
         }
 
+        if constexpr (NormTraits<K>::kHasFinal) {
+            h = ln_final.forward(graph, h);
+        }
+
         logits_node = output_proj.forward(graph, h);
         built = true;
     }
@@ -306,6 +368,10 @@ struct PersistentGrokGPT2 {
             h = layers[i].execute_forward(*h);
         }
 
+        if constexpr (NormTraits<K>::kHasFinal) {
+            h = ln_final.execute_forward(*h);
+        }
+
         output_proj.out = ttnn::add(ttnn::matmul(*h, output_proj.weight, false, true),
                                     output_proj.bias);
         return &output_proj.out;
@@ -317,472 +383,32 @@ struct PersistentGrokGPT2 {
         for (size_t i = 0; i < N; ++i) {
             layers[i].sgd_step(lr_, momentum, weight_decay);
         }
+        if constexpr (NormTraits<K>::kHasFinal) {
+            ln_final.sgd_step(lr_, momentum, weight_decay);
+        }
         output_proj.sgd_step(lr_, momentum, weight_decay);
     }
 
-    // Register all parameters with Adam optimizer
     void register_adam(Adam& adam) {
         ADAM_REGISTER_EMBEDDING(adam, tok, *device);
         ADAM_REGISTER_EMBEDDING(adam, pos, *device);
         for (size_t i = 0; i < N; ++i) {
             layers[i].register_adam(adam, *device);
         }
+        if constexpr (NormTraits<K>::kHasFinal) {
+            ADAM_REGISTER_LAYERNORM(adam, ln_final, *device);
+        }
         ADAM_REGISTER_LINEAR3D(adam, output_proj, *device);
     }
 };
 
-// =============================================================================
-// PersistentGrokGPT2LN: Grok GPT-2 with LayerNorm (for parity/debug)
-// =============================================================================
 template <size_t N>
-struct PersistentGrokGPT2LN {
-    static_assert(N >= 1, "Must have at least 1 layer");
+using PersistentGrokGPT2 = PersistentGrokGPT2T<N, NormKind::DyT>;
 
-    Embedding tok;
-    Embedding pos;
-    std::vector<PersistentTransformerLayerLN> layers;
-    LayerNorm ln_final;  // Final LayerNorm before output projection
-    Linear3D output_proj;
+template <size_t N>
+using PersistentGrokGPT2LN = PersistentGrokGPT2T<N, NormKind::LayerNorm>;
 
-    Tensor token_indices;
-    Tensor pos_indices;
-    Tensor tok_plus_pos;
-    Tensor d_tok_plus_pos;
-
-    Graph graph;
-    Value* token_node = nullptr;
-    Value* pos_node = nullptr;
-    Value* logits_node = nullptr;
-    bool built = false;
-
-    uint32_t batch, seq, dim, vocab;
-    float lr;
-    float ln_eps;
-    MeshDevice* device;
-
-    PersistentGrokGPT2LN(uint32_t b, uint32_t s, uint32_t d, uint32_t h, uint32_t ffn_mult,
-                         uint32_t v, float learning_rate, float ln_eps_, MeshDevice& dev)
-        // PyTorch-like initialization:
-        // - Embedding: N(0, 1) → std=1.0
-        // - Linear: kaiming uniform → std ≈ sqrt(1/fan_in)
-        : tok(v, d, b, s, 1.0f, dev),  // N(0,1) for embedding
-          pos(s, d, b, s, 1.0f, dev),  // N(0,1) for embedding
-          ln_final(b, s, d, ln_eps_, dev),  // Final LN
-          output_proj(b, s, d, v, std::sqrt(1.0f / d), dev),  // kaiming for linear
-          token_indices(make_indices(std::vector<uint32_t>(b * s, 0), ttnn::Shape({b, s}), dev)),
-          pos_indices(make_indices(PersistentGrokGPT2<N>::build_pos_indices(b, s), ttnn::Shape({b, s}), dev)),
-          tok_plus_pos(make_zeros(ttnn::Shape({b, s, d}), dev)),
-          d_tok_plus_pos(make_zeros(ttnn::Shape({b, s, d}), dev)),
-          batch(b), seq(s), dim(d), vocab(v),
-          lr(learning_rate),
-          ln_eps(ln_eps_),
-          device(&dev) {
-        layers.reserve(N);
-        float layer_init = std::sqrt(1.0f / d);  // kaiming for linear layers
-        for (size_t i = 0; i < N; ++i) {
-            layers.emplace_back(b, s, d, h, ffn_mult, layer_init, dev, ln_eps);
-        }
-    }
-
-    void set_tokens(const std::vector<uint32_t>& tokens) {
-        if (tokens.size() != static_cast<size_t>(batch) * seq) {
-            throw std::runtime_error("token buffer size mismatch");
-        }
-        token_indices = make_indices(tokens, ttnn::Shape({batch, seq}), *device);
-    }
-
-    void build_graph() {
-        token_node = graph.leaf(&token_indices, nullptr, false);
-        pos_node = graph.leaf(&pos_indices, nullptr, false);
-
-        auto* tok_v = tok.forward(graph, token_node);
-        auto* pos_v = pos.forward(graph, pos_node);
-        auto* h = add(graph, tok_v, pos_v, &tok_plus_pos, &d_tok_plus_pos);
-
-        for (size_t i = 0; i < N; ++i) {
-            h = layers[i].forward(graph, h);
-        }
-
-        // Final LayerNorm before output projection
-        h = ln_final.forward(graph, h);
-
-        logits_node = output_proj.forward(graph, h);
-        built = true;
-    }
-
-    Tensor* execute_forward() {
-        auto* tok_out = tok.execute_forward(token_indices);
-        auto* pos_out = pos.execute_forward(pos_indices);
-        tok_plus_pos = ttnn::add(*tok_out, *pos_out);
-
-        Tensor* h = &tok_plus_pos;
-        for (size_t i = 0; i < N; ++i) {
-            h = layers[i].execute_forward(*h);
-        }
-
-        // Final LayerNorm before output projection
-        h = ln_final.execute_forward(*h);
-
-        output_proj.out = ttnn::add(ttnn::matmul(*h, output_proj.weight, false, true),
-                                    output_proj.bias);
-        return &output_proj.out;
-    }
-
-    void sgd_step(float lr_, float momentum = 0.0f, float weight_decay = 0.0f) {
-        tok.sgd_step(lr_, momentum, weight_decay);
-        pos.sgd_step(lr_, momentum, weight_decay);
-        for (size_t i = 0; i < N; ++i) {
-            layers[i].sgd_step(lr_, momentum, weight_decay);
-        }
-        ln_final.sgd_step(lr_, momentum, weight_decay);
-        output_proj.sgd_step(lr_, momentum, weight_decay);
-    }
-
-    // Register all parameters with Adam optimizer
-    void register_adam(Adam& adam) {
-        ADAM_REGISTER_EMBEDDING(adam, tok, *device);
-        ADAM_REGISTER_EMBEDDING(adam, pos, *device);
-        for (size_t i = 0; i < N; ++i) {
-            layers[i].register_adam(adam, *device);
-        }
-        ADAM_REGISTER_LAYERNORM(adam, ln_final, *device);
-        ADAM_REGISTER_LINEAR3D(adam, output_proj, *device);
-    }
-};
-
-// =============================================================================
-// PersistentGPT2MXP: GPT-2 with batched typecast for BFP8 FFN
-// Key difference: TypecastCache batches all BFP8→BF16 conversions before backward
-// =============================================================================
-template<size_t N>
-
-
-struct PersistentGPT2MXP {
-    static_assert(N >= 1, "Must have at least 1 layer");
-
-    std::vector<TransformerLayerMXP> layers;
-    Linear3D output_proj;
-
-    // TypecastCache for batched BFP8→BF16 conversion
-    TypecastCache ffn_cache;
-
-    Tensor input, d_input;
-    Tensor target;
-    Tensor loss, d_loss, diff;
-
-    Graph graph;
-    Value* input_node = nullptr;
-    Value* loss_node = nullptr;
-    bool built = false;
-    bool cache_graph = std::getenv("MXP_DISABLE_GRAPH_CACHE") == nullptr;
-    uint32_t weight_typecast_every = 1;
-    uint64_t step = 0;
-
-    uint32_t batch, seq, dim, vocab;
-    float lr;
-    MeshDevice* device;
-
-    PersistentGPT2MXP(uint32_t b, uint32_t s, uint32_t d, uint32_t h, uint32_t ffn_mult,
-                      uint32_t v, float learning_rate, MeshDevice& dev)
-        : output_proj(b, s, d, v, 0.02f, dev),
-          input(make_zeros(ttnn::Shape({b, s, d}), dev)),
-          d_input(make_zeros(ttnn::Shape({b, s, d}), dev)),
-          target(make_zeros(ttnn::Shape({b, s, v}), dev)),
-          loss(make_zeros(ttnn::Shape({1, 1}), dev)),
-          d_loss(make_zeros(ttnn::Shape({1, 1}), dev)),
-          diff(make_zeros(ttnn::Shape({b, s, v}), dev)),
-          batch(b), seq(s), dim(d), vocab(v),
-          lr(learning_rate),
-          device(&dev)
-    {
-        layers.reserve(N);
-        for (size_t i = 0; i < N; ++i) {
-            layers.emplace_back(b, s, d, h, ffn_mult, 0.02f, dev);
-        }
-    }
-
-    void build_graph() {
-#ifdef TRACY_ENABLE
-        ZoneScopedN("PersistentGPT2MXP_build");
-#endif
-        input_node = graph.leaf(&input, &d_input, false);
-
-        Value* h = input_node;
-        for (size_t i = 0; i < N; ++i) {
-            h = layers[i].forward(graph, h);
-        }
-
-        auto* logits = output_proj.forward(graph, h);
-        loss_node = mse(graph, logits, &target, &loss, &d_loss, &diff);
-        graph.build_topo(loss_node);
-
-        // Register all FFN caches for batched typecast
-        ffn_cache.clear();
-        for (size_t i = 0; i < N; ++i) {
-            layers[i].register_caches(ffn_cache);
-        }
-
-        built = true;
-    }
-
-    // Execute forward without graph construction (reuses buffers)
-    void execute_forward() {
-        Tensor* h = &input;
-        for (size_t i = 0; i < N; ++i) {
-            h = layers[i].execute_forward(*h);
-        }
-
-        // Output projection
-        output_proj.out = ttnn::add(ttnn::matmul(*h, output_proj.weight, false, true), output_proj.bias);
-
-        // MSE loss
-        diff = ttnn::subtract(output_proj.out, target);
-        auto sq = ttnn::multiply(diff, diff);
-        loss = ttnn::mean(sq, std::nullopt, true);
-    }
-
-    void train_step() {
-#ifdef TRACY_ENABLE
-        ZoneScopedN("PersistentGPT2MXP_train_step");
-#endif
-        {
-#ifdef TRACY_ENABLE
-            ZoneScopedN("forward");
-#endif
-            if (!built || !cache_graph) {
-                build_graph();
-            }
-            if (cache_graph) {
-                execute_forward();
-            }
-            tt::tt_metal::distributed::Synchronize(device, std::nullopt);
-        }
-
-        // *** MXP: Batch typecast all FFN activations BEFORE backward ***
-        {
-#ifdef TRACY_ENABLE
-            ZoneScopedN("batch_typecast_ffn");
-#endif
-            ffn_cache.convert_all();
-            tt::tt_metal::distributed::Synchronize(device, std::nullopt);
-        }
-
-        // Backward pass (uses pre-casted BF16 tensors)
-        {
-#ifdef TRACY_ENABLE
-            ZoneScopedN("backward");
-#endif
-            graph.zero_grad();
-            graph.backward(loss_node);
-            tt::tt_metal::distributed::Synchronize(device, std::nullopt);
-        }
-
-        // SGD step
-        {
-#ifdef TRACY_ENABLE
-            ZoneScopedN("sgd_step");
-#endif
-            for (size_t i = 0; i < N; ++i) {
-                layers[i].sgd_step(lr);
-            }
-            output_proj.sgd_step(lr);
-            tt::tt_metal::distributed::Synchronize(device, std::nullopt);
-        }
-
-        if (!cache_graph) {
-            built = false;  // Rebuild graph each iteration when cache is disabled
-        }
-    }
-
-    float get_loss() {
-        tt::tt_metal::distributed::Synchronize(device, std::nullopt);
-        return static_cast<float>(loss.cpu().to_vector<bfloat16>()[0]);
-    }
-};
-
-// =============================================================================
-// PersistentGPT2MXP2: GPT-2 with FULLY batched typecast
-// Key difference from MXP: Also batches weight BF16→BFP8 conversion after SGD
-//
-// Phase flow:
-// 1. forward (BFP8 compute)
-// 2. batch_typecast_ffn (activation BFP8→BF16 for backward)
-// 3. backward (BF16 gradients)
-// 4. sgd_step_bf16_only (update BF16 masters, NO typecast)
-// 5. batch_typecast_weights (BF16→BFP8 for next forward) <- NEW
-// =============================================================================
-template<size_t N>
-
-
-struct PersistentGPT2MXP2 {
-    static_assert(N >= 1, "Must have at least 1 layer");
-
-    std::vector<TransformerLayerMXP> layers;
-    Linear3D output_proj;
-
-    // TypecastCache for batched BFP8→BF16 conversion (activations before backward)
-    TypecastCache ffn_cache;
-
-    // WeightTypecastCache for batched BF16→BFP8 conversion (weights after SGD)
-    WeightTypecastCache weight_cache;
-
-    Tensor input, d_input;
-    Tensor target;
-    Tensor loss, d_loss, diff;
-
-    Graph graph;
-    Value* input_node = nullptr;
-    Value* loss_node = nullptr;
-    bool built = false;
-    bool cache_graph = std::getenv("MXP_DISABLE_GRAPH_CACHE") == nullptr;
-    uint32_t weight_typecast_every = 1;
-    uint64_t step = 0;
-
-    uint32_t batch, seq, dim, vocab;
-    float lr;
-    MeshDevice* device;
-
-    PersistentGPT2MXP2(uint32_t b, uint32_t s, uint32_t d, uint32_t h, uint32_t ffn_mult,
-                       uint32_t v, float learning_rate, MeshDevice& dev)
-        : output_proj(b, s, d, v, 0.02f, dev),
-          input(make_zeros(ttnn::Shape({b, s, d}), dev)),
-          d_input(make_zeros(ttnn::Shape({b, s, d}), dev)),
-          target(make_zeros(ttnn::Shape({b, s, v}), dev)),
-          loss(make_zeros(ttnn::Shape({1, 1}), dev)),
-          d_loss(make_zeros(ttnn::Shape({1, 1}), dev)),
-          diff(make_zeros(ttnn::Shape({b, s, v}), dev)),
-          batch(b), seq(s), dim(d), vocab(v),
-          lr(learning_rate),
-          device(&dev)
-    {
-        layers.reserve(N);
-        for (size_t i = 0; i < N; ++i) {
-            layers.emplace_back(b, s, d, h, ffn_mult, 0.02f, dev);
-        }
-
-        if (const char* env = std::getenv("MXP_WEIGHT_TYPECAST_EVERY")) {
-            int val = std::atoi(env);
-            weight_typecast_every = val > 0 ? static_cast<uint32_t>(val) : 1;
-        }
-    }
-
-    void build_graph() {
-#ifdef TRACY_ENABLE
-        ZoneScopedN("PersistentGPT2MXP2_build");
-#endif
-        input_node = graph.leaf(&input, &d_input, false);
-
-        Value* h = input_node;
-        for (size_t i = 0; i < N; ++i) {
-            h = layers[i].forward(graph, h);
-        }
-
-        auto* logits = output_proj.forward(graph, h);
-        loss_node = mse(graph, logits, &target, &loss, &d_loss, &diff);
-        graph.build_topo(loss_node);
-
-        // Register all FFN caches for batched typecast (activations)
-        ffn_cache.clear();
-        for (size_t i = 0; i < N; ++i) {
-            layers[i].register_caches(ffn_cache);
-        }
-
-        // Register all FFN weight caches for batched typecast (weights)
-        weight_cache.clear();
-        for (size_t i = 0; i < N; ++i) {
-            layers[i].register_weight_caches(weight_cache);
-        }
-
-        built = true;
-    }
-
-    // Execute forward without graph construction (reuses buffers)
-    void execute_forward() {
-        Tensor* h = &input;
-        for (size_t i = 0; i < N; ++i) {
-            h = layers[i].execute_forward(*h);
-        }
-
-        // Output projection
-        output_proj.out = ttnn::add(ttnn::matmul(*h, output_proj.weight, false, true), output_proj.bias);
-
-        // MSE loss
-        diff = ttnn::subtract(output_proj.out, target);
-        auto sq = ttnn::multiply(diff, diff);
-        loss = ttnn::mean(sq, std::nullopt, true);
-    }
-
-    void train_step() {
-#ifdef TRACY_ENABLE
-        ZoneScopedN("PersistentGPT2MXP2_train_step");
-#endif
-        // 1. Forward pass (BFP8 compute)
-        {
-#ifdef TRACY_ENABLE
-            ZoneScopedN("forward");
-#endif
-            if (!built || !cache_graph) {
-                build_graph();
-            }
-            if (cache_graph) {
-                execute_forward();
-            }
-            tt::tt_metal::distributed::Synchronize(device, std::nullopt);
-        }
-
-        // 2. Batch typecast all FFN activations BFP8→BF16 BEFORE backward
-        {
-#ifdef TRACY_ENABLE
-            ZoneScopedN("batch_typecast_ffn");
-#endif
-            ffn_cache.convert_all();
-            tt::tt_metal::distributed::Synchronize(device, std::nullopt);
-        }
-
-        // 3. Backward pass (uses pre-casted BF16 tensors)
-        {
-#ifdef TRACY_ENABLE
-            ZoneScopedN("backward");
-#endif
-            graph.zero_grad();
-            graph.backward(loss_node);
-            tt::tt_metal::distributed::Synchronize(device, std::nullopt);
-        }
-
-        // 4. SGD step (BF16 only - no inline typecast)
-        {
-#ifdef TRACY_ENABLE
-            ZoneScopedN("sgd_step_bf16_only");
-#endif
-            for (size_t i = 0; i < N; ++i) {
-                layers[i].sgd_step_bf16_only(lr);
-            }
-            output_proj.sgd_step(lr);  // output_proj is BF16, normal sgd
-            tt::tt_metal::distributed::Synchronize(device, std::nullopt);
-        }
-
-        // 5. Batch typecast all FFN weights BF16→BFP8 for next forward
-        {
-#ifdef TRACY_ENABLE
-            ZoneScopedN("batch_typecast_weights");
-#endif
-            if (weight_typecast_every == 1 || (step % weight_typecast_every) == 0) {
-                weight_cache.convert_all();
-                tt::tt_metal::distributed::Synchronize(device, std::nullopt);
-            }
-        }
-
-        if (!cache_graph) {
-            built = false;  // Rebuild graph each iteration when cache is disabled
-        }
-
-        step += 1;
-    }
-
-    float get_loss() {
-        tt::tt_metal::distributed::Synchronize(device, std::nullopt);
-        return static_cast<float>(loss.cpu().to_vector<bfloat16>()[0]);
-    }
-};
+template <size_t N>
+using PersistentGrokGPT2RMS = PersistentGrokGPT2T<N, NormKind::RMSNorm>;
 
 } // namespace static_autograd

@@ -15,6 +15,8 @@
 #include <sstream>
 #include <cctype>
 #include <utility>
+#include <cstdlib>
+#include <mutex>
 
 namespace tensordiff::core {
 
@@ -27,6 +29,9 @@ enum class OpType {
     Binary,
 };
 
+void enable_op_recording(const std::filesystem::path& dir);
+void maybe_enable_op_recording_from_env();
+
 struct OpRecord {
     std::string name;
     OpType type;
@@ -34,10 +39,12 @@ struct OpRecord {
     std::vector<std::string> input_shapes;
     std::vector<std::string> input_origins;
     std::vector<std::string> input_dtypes;
+    std::vector<std::string> input_names;
     std::string output;
     std::string output_shape;
     std::string output_origin;
     std::string output_dtype;
+    std::string output_name;
     std::string opts;
 };
 
@@ -104,6 +111,7 @@ private:
                            const BaseTensor& output,
                            std::string_view opts) const {
 #if TENSORDIFF_ENABLE_RECORDING
+        maybe_enable_op_recording_from_env();
         if (op_recorder().enabled()) {
             op_recorder().record(name, type, inputs, output, opts);
         }
@@ -215,6 +223,8 @@ public:
             in_origins.reserve(inputs.size());
             std::vector<std::string> in_dtypes;
             in_dtypes.reserve(inputs.size());
+            std::vector<std::string> in_names;
+            in_names.reserve(inputs.size());
             for (size_t i = 0; i < inputs.size(); ++i) {
                 const auto& in = *inputs[i];
                 const auto origin = i < input_origins.size() ? input_origins[i] : std::string_view("cpu");
@@ -226,6 +236,7 @@ public:
                 in_shapes.push_back(shape_to_string(in.shape()));
                 in_origins.push_back(std::string(origin));
                 in_dtypes.push_back(dtype_name(in.dtype()));
+                in_names.push_back("");
             }
             std::ostringstream out_name;
             out_name << prefix << "_out.bin";
@@ -239,10 +250,12 @@ public:
             rec.input_shapes = std::move(in_shapes);
             rec.input_origins = std::move(in_origins);
             rec.input_dtypes = std::move(in_dtypes);
+            rec.input_names = std::move(in_names);
             rec.output = out_path;
             rec.output_shape = shape_to_string(output.shape());
             rec.output_origin = std::string(output_origin);
             rec.output_dtype = dtype_name(output.dtype());
+            rec.output_name = "";
             rec.opts = sanitize_opts(opts);
             records_.push_back(rec);
             append_manifest(rec);
@@ -253,6 +266,77 @@ public:
             (void)input_origins;
             (void)output;
             (void)output_origin;
+            (void)opts;
+#endif
+        }
+
+        void record_cpu_named(std::string_view op_name,
+                              OpType type,
+                              const std::vector<const CpuTensor*>& inputs,
+                              const std::vector<std::string_view>& input_origins,
+                              const std::vector<std::string_view>& input_names,
+                              const CpuTensor& output,
+                              std::string_view output_origin,
+                              std::string_view output_name,
+                              std::string_view opts = {}) {
+#if TENSORDIFF_ENABLE_RECORDING
+            if (!enabled_) return;
+            const std::string safe = sanitize(op_name);
+            const std::string prefix = make_prefix(safe);
+            std::vector<std::string> in_paths;
+            in_paths.reserve(inputs.size());
+            std::vector<std::string> in_shapes;
+            in_shapes.reserve(inputs.size());
+            std::vector<std::string> in_origins;
+            in_origins.reserve(inputs.size());
+            std::vector<std::string> in_dtypes;
+            in_dtypes.reserve(inputs.size());
+            std::vector<std::string> in_names;
+            in_names.reserve(inputs.size());
+            for (size_t i = 0; i < inputs.size(); ++i) {
+                const auto& in = *inputs[i];
+                const auto origin = i < input_origins.size() ? input_origins[i] : std::string_view("cpu");
+                const auto name = i < input_names.size() ? input_names[i] : std::string_view();
+                std::ostringstream fname;
+                fname << prefix << "_in" << i << ".bin";
+                const auto path = (dir_ / fname.str()).string();
+                save_tensor(in, path, origin);
+                in_paths.push_back(path);
+                in_shapes.push_back(shape_to_string(in.shape()));
+                in_origins.push_back(std::string(origin));
+                in_dtypes.push_back(dtype_name(in.dtype()));
+                in_names.push_back(std::string(name));
+            }
+            std::ostringstream out_name_stream;
+            out_name_stream << prefix << "_out.bin";
+            const auto out_path = (dir_ / out_name_stream.str()).string();
+            save_tensor(output, out_path, output_origin, op_name);
+
+            OpRecord rec;
+            rec.name = std::string(op_name);
+            rec.type = type;
+            rec.inputs = std::move(in_paths);
+            rec.input_shapes = std::move(in_shapes);
+            rec.input_origins = std::move(in_origins);
+            rec.input_dtypes = std::move(in_dtypes);
+            rec.input_names = std::move(in_names);
+            rec.output = out_path;
+            rec.output_shape = shape_to_string(output.shape());
+            rec.output_origin = std::string(output_origin);
+            rec.output_dtype = dtype_name(output.dtype());
+            rec.output_name = std::string(output_name);
+            rec.opts = sanitize_opts(opts);
+            records_.push_back(rec);
+            append_manifest(rec);
+#else
+            (void)op_name;
+            (void)type;
+            (void)inputs;
+            (void)input_origins;
+            (void)input_names;
+            (void)output;
+            (void)output_origin;
+            (void)output_name;
             (void)opts;
 #endif
         }
@@ -313,7 +397,7 @@ public:
             std::ofstream f(path, std::ios::app);
             if (!f) return;
             if (!manifest_initialized_) {
-                f << "idx\top\ttype\tinputs\tinput_shapes\tinput_origins\tinput_dtypes\toutput\toutput_shape\toutput_origin\toutput_dtype\topts\n";
+                f << "idx\top\ttype\tinputs\tinput_shapes\tinput_origins\tinput_dtypes\tinput_names\toutput\toutput_shape\toutput_origin\toutput_dtype\toutput_name\topts\n";
                 manifest_initialized_ = true;
             }
             f << (counter_ - 1) << "\t" << rec.name << "\t"
@@ -337,9 +421,14 @@ public:
                 if (i) f << ",";
                 f << rec.input_dtypes[i];
             }
+            f << "\t";
+            for (size_t i = 0; i < rec.input_names.size(); ++i) {
+                if (i) f << ",";
+                f << rec.input_names[i];
+            }
             f << "\t" << rec.output << "\t" << rec.output_shape << "\t"
               << rec.output_origin << "\t" << rec.output_dtype << "\t"
-              << rec.opts << "\n";
+              << rec.output_name << "\t" << rec.opts << "\n";
         }
     };
 
@@ -351,6 +440,19 @@ public:
 
 inline BaseTensor::OpRecorder& op_recorder() {
     return BaseTensor::op_recorder();
+}
+
+inline void maybe_enable_op_recording_from_env() {
+#if TENSORDIFF_ENABLE_RECORDING
+    static std::once_flag flag;
+    std::call_once(flag, []() {
+        if (const char* dir = std::getenv("TENSORDIFF_OPLOG_DIR")) {
+            if (*dir) {
+                enable_op_recording(dir);
+            }
+        }
+    });
+#endif
 }
 
 inline void enable_op_recording(const std::filesystem::path& dir) {
@@ -367,6 +469,15 @@ inline void disable_op_recording() {
 #endif
 }
 
+inline bool op_recording_enabled() {
+#if TENSORDIFF_ENABLE_RECORDING
+    maybe_enable_op_recording_from_env();
+    return op_recorder().enabled();
+#else
+    return false;
+#endif
+}
+
 inline void record_op_cpu(std::string_view op_name,
                           OpType type,
                           const std::vector<const CpuTensor*>& inputs,
@@ -375,6 +486,7 @@ inline void record_op_cpu(std::string_view op_name,
                           std::string_view output_origin,
                           std::string_view opts = {}) {
 #if TENSORDIFF_ENABLE_RECORDING
+    maybe_enable_op_recording_from_env();
     op_recorder().record_cpu(op_name, type, inputs, input_origins, output, output_origin, opts);
 #else
     (void)op_name;
@@ -383,6 +495,31 @@ inline void record_op_cpu(std::string_view op_name,
     (void)input_origins;
     (void)output;
     (void)output_origin;
+    (void)opts;
+#endif
+}
+
+inline void record_op_cpu(std::string_view op_name,
+                          OpType type,
+                          const std::vector<const CpuTensor*>& inputs,
+                          const std::vector<std::string_view>& input_origins,
+                          const std::vector<std::string_view>& input_names,
+                          const CpuTensor& output,
+                          std::string_view output_origin,
+                          std::string_view output_name,
+                          std::string_view opts = {}) {
+#if TENSORDIFF_ENABLE_RECORDING
+    maybe_enable_op_recording_from_env();
+    op_recorder().record_cpu_named(op_name, type, inputs, input_origins, input_names, output, output_origin, output_name, opts);
+#else
+    (void)op_name;
+    (void)type;
+    (void)inputs;
+    (void)input_origins;
+    (void)input_names;
+    (void)output;
+    (void)output_origin;
+    (void)output_name;
     (void)opts;
 #endif
 }

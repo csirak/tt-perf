@@ -62,7 +62,7 @@ disable_op_recording();
 
 Manifest columns:
 ```
-idx	op	type	inputs	input_shapes	input_origins	input_dtypes	output	output_shape	output_origin	output_dtype	opts
+idx	op	type	inputs	input_shapes	input_origins	input_dtypes	input_names	output	output_shape	output_origin	output_dtype	output_name	opts
 ```
 
 ### Compile-time switch

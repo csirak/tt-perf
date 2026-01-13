@@ -1,0 +1,7 @@
+idx	op	type	inputs	input_shapes	input_origins	input_dtypes	input_names	output	output_shape	output_origin	output_dtype	output_name	opts
+0	ffn_w1_matmul	binary	outputs/ffn_run/oplog/0000_ffn_w1_matmul_in0.bin,outputs/ffn_run/oplog/0000_ffn_w1_matmul_in1.bin	1x32x64,64x256	cpu,cpu	f32,f32	ffn_input,w1	outputs/ffn_run/oplog/0000_ffn_w1_matmul_out.bin	1x32x256	cpu	f32	ffn_w1_matmul	
+1	ffn_w1_bias	binary	outputs/ffn_run/oplog/0001_ffn_w1_bias_in0.bin,outputs/ffn_run/oplog/0001_ffn_w1_bias_in1.bin	1x32x256,1x1x256	cpu,cpu	f32,f32	ffn_w1_matmul,b1	outputs/ffn_run/oplog/0001_ffn_w1_bias_out.bin	1x32x256	cpu	f32	ffn_w1_bias	
+2	ffn_gelu	unary	outputs/ffn_run/oplog/0002_ffn_gelu_in0.bin	1x32x256	cpu	f32	ffn_w1_bias	outputs/ffn_run/oplog/0002_ffn_gelu_out.bin	1x32x256	cpu	f32	ffn_gelu	
+3	ffn_w2_matmul	binary	outputs/ffn_run/oplog/0003_ffn_w2_matmul_in0.bin,outputs/ffn_run/oplog/0003_ffn_w2_matmul_in1.bin	1x32x256,256x64	cpu,cpu	f32,f32	ffn_gelu,w2	outputs/ffn_run/oplog/0003_ffn_w2_matmul_out.bin	1x32x64	cpu	f32	ffn_w2_matmul	
+4	ffn_w2_bias	binary	outputs/ffn_run/oplog/0004_ffn_w2_bias_in0.bin,outputs/ffn_run/oplog/0004_ffn_w2_bias_in1.bin	1x32x64,1x1x64	cpu,cpu	f32,f32	ffn_w2_matmul,b2	outputs/ffn_run/oplog/0004_ffn_w2_bias_out.bin	1x32x64	cpu	f32	ffn_w2_bias	
+5	loss	unary	outputs/ffn_run/oplog/0005_loss_in0.bin	1x32x64	cpu	f32	ffn_w2_bias	outputs/ffn_run/oplog/0005_loss_out.bin	1	cpu	f32	loss	

@@ -1285,6 +1285,10 @@ tensordiff-softmax-bw-ttnn-run:
 
 TENSORDIFF_DIR := ../tensordiff
 TENSORDIFF_BUILD_DIR := $(TENSORDIFF_DIR)/build
+TENSORDIFFGRAD_DIR := ../tensordiffgrad
+TENSORDIFFGRAD_BUILD_DIR := $(TENSORDIFFGRAD_DIR)/build
+RECORDER_TEST1_DIR := ../experiments/recorder_test1
+RECORDER_TEST1_BUILD_DIR := $(RECORDER_TEST1_DIR)/build
 
 tensordiff-torch-compare: tensordiff-torch-compare-build tensordiff-torch-compare-run
 
@@ -1348,6 +1352,78 @@ tensordiff-ops-test-torch-run:
 	cd $(TENSORDIFF_BUILD_DIR) && \
 		TT_METAL_HOME=$(TT_METAL) LD_LIBRARY_PATH=$(HOME)/libtorch/lib:$$LD_LIBRARY_PATH \
 		./tensordiff_tensor_ops_test
+
+# === tensordiffgrad: tensor ops test (TTNN) ===
+# Usage: make tensordiffgrad-ops-test
+
+tensordiffgrad-ops-test: tensordiffgrad-ops-test-sync tensordiffgrad-ops-test-build tensordiffgrad-ops-test-run
+
+tensordiffgrad-ops-test-sync:
+	mkdir -p $(AUTOGRAD_DIR)/tensordiff
+	cp -r ../tensordiff/core $(AUTOGRAD_DIR)/tensordiff/
+	cp ../tensordiff/ttnn_tensor.hpp $(AUTOGRAD_DIR)/tensordiff/
+	cp ../tensordiffgrad/tests/backend_ops_test.cpp $(AUTOGRAD_DIR)/main.cpp
+
+tensordiffgrad-ops-test-build:
+	cd $(BUILD_DIR) && ninja example_autograd
+
+tensordiffgrad-ops-test-run:
+	cd $(TT_METAL) && TENSORDIFF_OPLOG_DIR=$(HOME)/ttnn-perf/tensordiffgrad/outputs/oplog \
+		./build_Release/ttnn/examples/example_autograd
+
+# === tensordiffgrad: tensor ops test (Torch/libtorch) ===
+# Usage: make tensordiffgrad-ops-test-torch
+
+tensordiffgrad-ops-test-torch: tensordiffgrad-ops-test-torch-build tensordiffgrad-ops-test-torch-run
+
+tensordiffgrad-ops-test-torch-build:
+	mkdir -p $(TENSORDIFFGRAD_BUILD_DIR)
+	cd $(TENSORDIFFGRAD_BUILD_DIR) && \
+		TT_METAL_HOME=$(TT_METAL) cmake -DCMAKE_PREFIX_PATH=$(HOME)/libtorch .. && \
+		$(MAKE) tensordiffgrad_torch_ops_test
+
+tensordiffgrad-ops-test-torch-run:
+	cd $(TENSORDIFFGRAD_BUILD_DIR) && \
+		TT_METAL_HOME=$(TT_METAL) TENSORDIFF_OPLOG_DIR=$(HOME)/ttnn-perf/tensordiffgrad/outputs/oplog_torch \
+		LD_LIBRARY_PATH=$(HOME)/libtorch/lib:$$LD_LIBRARY_PATH \
+		./tensordiffgrad_torch_ops_test
+
+# === tensordiffgrad: FFN test (Torch/libtorch, CPU) ===
+# Usage: make tensordiffgrad-ffn-test-torch
+
+tensordiffgrad-ffn-test-torch: tensordiffgrad-ffn-test-torch-build tensordiffgrad-ffn-test-torch-run
+
+tensordiffgrad-ffn-test-torch-build:
+	mkdir -p $(TENSORDIFFGRAD_BUILD_DIR)
+	cd $(TENSORDIFFGRAD_BUILD_DIR) && \
+		TT_METAL_HOME=$(TT_METAL) cmake -DCMAKE_PREFIX_PATH=$(HOME)/libtorch .. && \
+		$(MAKE) tensordiffgrad_torch_ffn_test
+
+tensordiffgrad-ffn-test-torch-run:
+	cd $(TENSORDIFFGRAD_BUILD_DIR) && \
+		TT_METAL_HOME=$(TT_METAL) TENSORDIFF_OPLOG_DIR=$(HOME)/ttnn-perf/experiments/ffn_forward/oplog_torch \
+		LD_LIBRARY_PATH=$(HOME)/libtorch/lib:$$LD_LIBRARY_PATH \
+		TENSORDIFFGRAD_OUT_DIR=$(HOME)/ttnn-perf/experiments/ffn_forward/torch \
+		./tensordiffgrad_torch_ffn_test
+
+# === TTNN FFN forward test (static_autograd ops) ===
+# Usage: make ffn-forward
+
+ffn-forward: ffn-forward-sync ffn-forward-build ffn-forward-run
+
+ffn-forward-sync:
+	mkdir -p $(AUTOGRAD_DIR)/tensordiff
+	cp -r ../tensordiff/core $(AUTOGRAD_DIR)/tensordiff/
+	cp ../autograd/value.hpp $(AUTOGRAD_DIR)/
+	cp ../autograd/ops.hpp $(AUTOGRAD_DIR)/
+	cp ../autograd/tests/test_ffn_forward.cpp $(AUTOGRAD_DIR)/main.cpp
+
+ffn-forward-build:
+	cd $(BUILD_DIR) && ninja example_autograd
+
+ffn-forward-run:
+	cd $(TT_METAL) && TENSORDIFF_OPLOG_DIR=$(HOME)/ttnn-perf/experiments/ffn_forward/oplog \
+		./build_Release/ttnn/examples/example_autograd
 
 # === tensordiff: BaseTensor dispatch test (Torch/libtorch) ===
 # Usage: make tensordiff-dispatch-test-torch
@@ -1665,6 +1741,45 @@ gpt2-rebuild-build:
 
 gpt2-rebuild-run:
 	cd $(TT_METAL) && ./build_Release/ttnn/examples/example_autograd
+
+# === Recorder Test 1 (TTNN) ===
+# Usage: RECORDER_TEST1_CONFIG=~/ttnn-perf/experiments/recorder_test1/recorder_test1.yaml make recorder-test1-ttnn
+
+recorder-test1-ttnn: recorder-test1-ttnn-sync recorder-test1-ttnn-build recorder-test1-ttnn-run
+
+recorder-test1-ttnn-sync:
+	mkdir -p $(AUTOGRAD_DIR)/autograd
+	mkdir -p $(AUTOGRAD_DIR)/utils
+	mkdir -p $(AUTOGRAD_DIR)/tensordiff
+	cp -r nn $(AUTOGRAD_DIR)/autograd/
+	cp -r utils $(AUTOGRAD_DIR)/autograd/
+	cp ops.hpp tensor_group.hpp value.hpp nn.hpp $(AUTOGRAD_DIR)/autograd/
+	cp common.hpp $(AUTOGRAD_DIR)/
+	cp -r ../tensordiff/core $(AUTOGRAD_DIR)/tensordiff/
+	cp ../experiments/recorder_test1/recorder_test1_ttnn.cpp $(AUTOGRAD_DIR)/main.cpp
+
+recorder-test1-ttnn-build:
+	cd $(BUILD_DIR) && ninja example_autograd
+
+recorder-test1-ttnn-run:
+	cd $(TT_METAL) && RECORDER_TEST1_CONFIG=$(HOME)/ttnn-perf/experiments/recorder_test1/recorder_test1.yaml \
+		./build_Release/ttnn/examples/example_autograd
+
+# === Recorder Test 1 (Torch C++) ===
+# Usage: make recorder-test1-torch
+
+recorder-test1-torch: recorder-test1-torch-build recorder-test1-torch-run
+
+recorder-test1-torch-build:
+	mkdir -p $(RECORDER_TEST1_BUILD_DIR)
+	cd $(RECORDER_TEST1_BUILD_DIR) && \
+		TT_METAL_HOME=$(TT_METAL) cmake -DCMAKE_PREFIX_PATH=$(HOME)/libtorch .. && \
+		$(MAKE) recorder_test1_torch
+
+recorder-test1-torch-run:
+	cd $(RECORDER_TEST1_BUILD_DIR) && \
+		TT_METAL_HOME=$(TT_METAL) LD_LIBRARY_PATH=$(HOME)/libtorch/lib:$$LD_LIBRARY_PATH \
+		./recorder_test1_torch
 
 # === Train Folder: GPT2 Rebuild (incremental stages) ===
 # Usage: TRAIN_GPT2_CONFIG=~/ttnn-perf/train/gpt2/default.yaml make train-gpt2
